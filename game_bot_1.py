@@ -7,7 +7,7 @@ import time
 import tkinter as tk
 import traceback
 from tkinter import ttk, messagebox
-
+import mss
 import cv2
 import numpy as np
 import pyautogui
@@ -36,6 +36,7 @@ class GameBot:
     def __init__(self, game_title="游戏窗口标题", battle_time=0, battle_count=0, mode=0, priority_skills=None):
         self.running = True
         self.hotkey_listener = None
+        self.sct = mss.mss()
         """初始化游戏机器人"""
         self.game_title = game_title
         self.battle_time = battle_time
@@ -47,7 +48,7 @@ class GameBot:
         # 获取templates目录路径（支持PyInstaller打包后的路径）
         if getattr(sys, 'frozen', False):
             # 如果是打包后的exe文件
-            self.template_dir = os.path.join(sys._MEIPASS, "templates")
+            self.template_dir = os.path.join(os.path.dirname(sys.executable), "templates")
         else:
             # 如果是开发环境
             self.template_dir = "templates"
@@ -95,27 +96,101 @@ class GameBot:
                 return False
 
     def take_screenshot(self):
-        """截取游戏窗口画面"""
+        if not hasattr(self, "_sct"):
+            self._sct = mss.mss()  # ✅ 只创建一次
+
         if not self.game_window:
             if not self.find_game_window():
                 return None
 
-        screenshot = pyautogui.screenshot(region=self.game_window)
-        return screenshot
+        left, top, width, height = self.game_window
 
-    def save_screenshot(self, filename=None):
-        """保存截图"""
-        screenshot = self.take_screenshot()
-        if screenshot:
-            if not filename:
-                filename = f"{self.screenshot_dir}/{int(time.time())}.png"
-            screenshot.save(filename)
-            print(f"截图已保存: {filename}")
-            return filename
+        monitor = {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height
+        }
+
+        screenshot = self._sct.grab(monitor)
+
+        img = np.array(screenshot)
+        return img[:, :, :3]  # BGRA → BGR
+
+    def find_template(
+            self,
+            template_names,  # ✅ 支持字符串 或 数组
+            threshold=0.8,
+            use_gray=True,
+            roi=None
+    ):
+        if not self.running:
+            return None
+        # ===== 0. 统一成数组 =====
+        if isinstance(template_names, str):
+            template_names = [template_names]
+
+        # ===== 1. 初始化缓存 =====
+        if not hasattr(self, "_template_cache"):
+            self._template_cache = {}
+
+        # ===== 2. 截图 =====
+        img = self.take_screenshot()
+        if img is None:
+            return None
+
+        # ===== 3. 灰度 =====
+        if use_gray:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # ===== 4. ROI =====
+        if roi:
+            x, y, w, h = roi
+            img = img[y:y + h, x:x + w]
+            offset_x, offset_y = x, y
+        else:
+            offset_x, offset_y = 0, 0
+
+        # ===== 5. 按顺序匹配（命中即返回） =====
+        for template_name in template_names:
+            template_name = str(template_name)
+            cache_key = (template_name, use_gray)
+
+            # ---- 读取 / 缓存模板 ----
+            if cache_key not in self._template_cache:
+                template_path = os.path.join(self.template_dir, template_name)
+
+                if use_gray:
+                    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+                else:
+                    template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+
+                if template is None:
+                    print(f"无法加载模板: {template_path}")
+                    continue
+
+                self._template_cache[cache_key] = template
+            else:
+                template = self._template_cache[cache_key]
+
+            # ---- 模板匹配 ----
+            result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            # ---- 命中直接返回 ----
+            if max_val >= threshold:
+                h, w = template.shape[:2]
+
+                center_x = self.game_window[0] + offset_x + max_loc[0] + w // 2
+                center_y = self.game_window[1] + offset_y + max_loc[1] + h // 2
+                return center_x, center_y
+
+        # ===== 全部没命中 =====
         return None
 
-    def find_template(self, template_name, threshold=0.8):
+    def find_template1(self, template_name, threshold=0.8):
         # ===== 1. 模板缓存 =====
+        global template_path
         if not hasattr(self, "_template_cache"):
             self._template_cache = {}
 
@@ -136,12 +211,9 @@ class GameBot:
             return None
 
         """在游戏窗口中查找模板图像"""
-        screenshot = self.take_screenshot()
-        if not screenshot:
+        img = self.take_screenshot()
+        if img is None:
             return None
-
-        # 转换为OpenCV格式
-        img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
 
         # 模板匹配
         result = cv2.matchTemplate(img, template_color, cv2.TM_CCOEFF_NORMED)
@@ -151,15 +223,100 @@ class GameBot:
             h, w = template_color.shape[:2]
             center_x = self.game_window[0] + max_loc[0] + w // 2
             center_y = self.game_window[1] + max_loc[1] + h // 2
-            #print(f"找到匹配: {template_path}, 位置: ({center_x}, {center_y}), 相似度: {max_val:.2f}")
-            return (center_x, center_y)
+            return center_x, center_y
 
         # print(f"未找到匹配: {template_path}")
         return None
 
-    def find_all_templates(self, template_name, threshold=0.8):
-        """纯彩色模板匹配"""
+    def find_all_templates1(
+            self,
+            template_name,
+            threshold=0.8,
+            use_gray=True,  # ✅ 新增：灰度控制
+            roi=None
+    ):
+        if not self.running:
+            return []
+        # ===== 1. 模板缓存 =====
+        if not hasattr(self, "_template_cache"):
+            self._template_cache = {}
 
+        cache_key = (template_name, use_gray)
+
+        if cache_key not in self._template_cache:
+            template_path = os.path.join(self.template_dir, template_name)
+
+            if use_gray:
+                template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+            else:
+                template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+
+            if template is None:
+                print(f"无法加载模板: {template_path}")
+                return []
+
+            self._template_cache[cache_key] = template
+        else:
+            template = self._template_cache[cache_key]
+
+        # ===== 2. 截图 =====
+        img = self.take_screenshot()
+        if img is None:
+            return []
+
+        # ===== 3. 灰度处理 =====
+        if use_gray:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # ===== 4. ROI =====
+        if roi:
+            x, y, w, h = roi
+            img = img[y:y + h, x:x + w]
+            offset_x, offset_y = x, y
+        else:
+            offset_x, offset_y = 0, 0
+
+        # ===== 5. 模板匹配 =====
+        result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+
+        # ===== 6. 阈值筛选 =====
+        locations = np.where(result >= threshold)
+
+        h, w = template.shape[:2]
+
+        boxes = []
+        scores = []
+
+        # ⚠️ zip顺序是 (y, x)
+        for y, x in zip(*locations):
+            boxes.append([int(x), int(y), int(w), int(h)])
+            scores.append(float(result[y, x]))
+
+        if not boxes:
+            return []
+
+        # ===== 7. NMS 去重 =====
+        indices = cv2.dnn.NMSBoxes(boxes, scores, threshold, 0.3)
+
+        matches = []
+
+        # ⚠️ OpenCV返回可能是 [[0],[1]] 或 [0,1]
+        if len(indices) > 0:
+            indices = np.array(indices).flatten()
+
+            for i in indices:
+                x, y, w, h = boxes[i]
+
+                center_x = self.game_window[0] + offset_x + x + w // 2
+                center_y = self.game_window[1] + offset_y + y + h // 2
+
+                matches.append((center_x, center_y))
+
+        return matches
+
+    def find_all_templates(self, template_name, threshold=0.8):
+        if not self.running:
+            return []
         # ===== 1. 模板缓存 =====
         if not hasattr(self, "_template_cache"):
             self._template_cache = {}
@@ -176,12 +333,9 @@ class GameBot:
             template_color = self._template_cache[template_name]
 
         # ===== 2. 截图 =====
-        screenshot = self.take_screenshot()
-        if screenshot is None:
+        img_color = self.take_screenshot()
+        if img_color is None:
             return []
-
-        img_color = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-
         # ===== 3. 彩色模板匹配 =====
         result = cv2.matchTemplate(img_color, template_color, cv2.TM_CCOEFF_NORMED)
 
@@ -208,86 +362,68 @@ class GameBot:
             center_x = self.game_window[0] + x + w // 2
             center_y = self.game_window[1] + y + h // 2
 
-            matches.insert(0, (center_x, center_y))
+            matches.append((center_x, center_y))
             print(f"找到匹配: 位置: ({center_x}, {center_y})")
         return matches
 
-    def find_all_templates1(self, template_name, threshold=0.8):
-        """在游戏窗口中查找所有匹配的模板图像位置"""
-        template_path = os.path.join(self.template_dir, template_name)
-
-        screenshot = self.take_screenshot()
-        if not screenshot:
-            return []
-
-        # 转换为OpenCV格式
-        img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-        template = cv2.imread(template_path)
-
-        if template is None:
-            print(f"无法加载模板: {template_path}")
-            return []
-
-        # 模板匹配
-        result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-
-        # 获取所有超过阈值的匹配位置
-        locations = np.where(result >= threshold)
-        matches = []
-
-        # 获取模板尺寸
-        h, w = template.shape[:2]
-
-        # 处理找到的匹配位置
-        for pt in zip(*locations[::-1]):  # 切换x和y坐标
-            center_x = self.game_window[0] + pt[0] + w // 2
-            center_y = self.game_window[1] + pt[1] + h // 2
-            matches.append((center_x, center_y))
-            print(f"找到匹配: {template_path}, 位置: ({center_x}, {center_y})")
-
-        return matches
-
+    def sleep_interruptible(self, seconds, step=0.1):
+        """Sleep in small chunks so stop requests take effect quickly."""
+        end_time = time.time() + seconds
+        while self.running and time.time() < end_time:
+            time.sleep(min(step, end_time - time.time()))
+        return self.running
     def click(self, x, y, duration=0.2, human_like=True):
-        """模拟鼠标点击"""
+        """Click only while the bot is still running."""
+        if not self.running:
+            return False
         if human_like:
-            # 添加随机偏移，模拟人类点击
             x += random.randint(-5, 5)
             y += random.randint(-5, 5)
             duration += random.uniform(-0.1, 0.1)
             duration = max(0.1, duration)
 
         pyautogui.moveTo(x, y, duration=duration)
+        if not self.running:
+            return False
         pyautogui.click()
         print(f"点击位置: ({x}, {y})")
+        return True
 
     def click_fast(self, x, y):
-        """快速点击，不添加随机偏移和移动时间"""
+        """Fast click only while the bot is still running."""
+        if not self.running:
+            return False
         pyautogui.moveTo(x, y, duration=0)
+        if not self.running:
+            return False
         pyautogui.click()
         print(f"快速点击位置: ({x}, {y})")
+        return True
 
     def press_key(self, key, presses=1, interval=0.1, human_like=True):
-        """模拟按键"""
+        """Press a key only while the bot is still running."""
+        if not self.running:
+            return False
         if human_like:
             interval += random.uniform(-0.05, 0.05)
             interval = max(0.05, interval)
 
         pyautogui.press(key, presses=presses, interval=interval)
         print(f"按下按键: {key}")
-
+        return True
     def find_im(self):
         """判断能否发现环球页面"""
         im = self.find_template("im.png")
         if im:
             self.click(*im)
-            time.sleep(1)
+            self.sleep_interruptible(1)
 
     def find_click_continue(self):
         """判断能否发现继续按钮"""
         continue_button = self.find_template("click-continue.png")
         if continue_button:
             self.click(*continue_button)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_team_up(self):
         """判断能否发现队伍页面"""
@@ -303,25 +439,42 @@ class GameBot:
                     xy = self.find_template("recruitment-1.png")
                 if xy:
                     self.click(*xy)
-                    time.sleep(0.2)
+                    self.sleep_interruptible(0.2)
                 else:
                     break
             self.find_reconnection()
-            for i in range(20):
+            for i in range(30):
+                if not self.running:
+                    break
                 try:
-                    huanqiu_positions = self.find_all_templates("huanqiu.png")
-                    print(f"matches数量: {len(huanqiu_positions)}")
-                    if huanqiu_positions:
-                        # 使用快速点击方法点击所有找到的环球按钮
-                        for pos in huanqiu_positions:
-                            self.click_fast(*pos)
+                    huanqiu_positions = []
+                    for template_name, threshold in [
+                        ("huanqiu2.png", 0.7),
+                        ("huanqiu.png", 0.75),
+                        ("huanqiu1.png", 0.75),
+                    ]:
+                        huanqiu_positions.extend(self.find_all_templates(template_name, threshold=threshold))
+
+                    deduped_positions = []
+                    for pos in sorted(huanqiu_positions, key=lambda p: p[1], reverse=True):
+                        if all(abs(pos[1] - old_pos[1]) > 25 for old_pos in deduped_positions):
+                            deduped_positions.append(pos)
+
+                    print(f"matches数量: {len(deduped_positions)}")
+                    if deduped_positions:
+                        # 从下往上点击；统一点同一行右侧“加入”区域，避免点到标题文字
+                        join_x = self.game_window[0] + int(self.game_window[2] * 0.82)
+                        for _, y in deduped_positions:
+                            if not self.running:
+                                break
+                            self.click_fast(join_x, y)
                     else:
                         print("未找到环球按钮")
-                        time.sleep(0.1)  # 减少等待时间
+                        self.sleep_interruptible(0.1)  # 减少等待时间
                 except Exception as e:
                     print("查找环球按钮时出错:", e)
                     traceback.print_exc()
-                    time.sleep(0.1)  # 减少等待时间
+                    self.sleep_interruptible(0.1)  # 减少等待时间
                 else:
                     print("未找到招募页面")
 
@@ -331,15 +484,15 @@ class GameBot:
         if not huanqiu_team:
             huanqiu_team = self.find_template("in-huanqiu-team.png")
         if huanqiu_team:
-            time.sleep(6)
-        else:
-            leave = self.find_template("leave.png")
-            if leave:
-                print("在队伍中")
-                self.click(*leave)
-                queding = self.find_template("queding.png")
-                if queding:
-                    self.click(*queding)
+            self.sleep_interruptible(6)
+        # else:
+        #     leave = self.find_template("leave.png")
+        #     if leave:
+        #         print("在队伍中")
+        #         self.click(*leave)
+        #         queding = self.find_template("queding.png")
+        #         if queding:
+        #             self.click(*queding)
 
     def find_home_close(self):
         """判断能否发现关闭按钮"""
@@ -354,7 +507,7 @@ class GameBot:
 
         if close:
             self.click(*close)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_close(self):
         closes = [
@@ -366,7 +519,7 @@ class GameBot:
             close = self.find_template(close)
             if close:
                 self.click(*close)
-                time.sleep(0.2)
+                self.sleep_interruptible(0.2)
                 return True
         return False
 
@@ -375,7 +528,7 @@ class GameBot:
         reconnection = self.find_template("reconnection.png")
         if reconnection:
             self.click(*reconnection)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_huanqiu(self):
         """判断能否发现环球按钮"""
@@ -385,10 +538,10 @@ class GameBot:
         """找到战斗位置"""
         battle = self.find_template("battle.png")
         if not battle:
-            battle = self.find_template("battle-1.png")
+            battle = self.find_template("battle-1.png", threshold=0.7)
         if battle:
             self.click(*battle)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
             return True
         return False
 
@@ -397,17 +550,27 @@ class GameBot:
         sure = self.find_template("sure.png")
         if sure:
             self.click(*sure)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_battling_continue(self):
         """判断能否发现继续战斗按钮"""
         continue_battle = self.find_template("battling-continue.png")
         if continue_battle:
             self.click(*continue_battle)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_skill(self):
         """判断能否发现技能按钮"""
+        skill_roi = None
+        if self.game_window:
+            _, _, window_width, window_height = self.game_window
+            skill_roi = (
+                0,
+                int(window_height * 0.39),
+                window_width,
+                int(window_height * 0.22)
+            )
+
         # 首先检查4个优先技能
         for priority_skill_templates in self.priority_skills:
             if priority_skill_templates:
@@ -416,10 +579,10 @@ class GameBot:
                     # 确保文件名包含.png扩展名
                     if not template.endswith('.png'):
                         template = f"{template}.png"
-                    skill_pos = self.find_template(template)
+                    skill_pos = self.find_template(template, roi=skill_roi)
                     if skill_pos:
                         self.click(*skill_pos)
-                        time.sleep(0.2)
+                        self.sleep_interruptible(0.2)
                         return None
 
         # 如果优先技能未匹配到，从全部技能中按顺序匹配
@@ -428,10 +591,10 @@ class GameBot:
                 # 确保文件名包含.png扩展名
                 if not template.endswith('.png'):
                     template = f"{template}.png"
-                skill_pos = self.find_template(template)
+                skill_pos = self.find_template(template, roi=skill_roi)
                 if skill_pos:
                     self.click(*skill_pos)
-                    time.sleep(0.2)
+                    self.sleep_interruptible(0.2)
                     return None
 
         return None
@@ -451,10 +614,10 @@ class GameBot:
 
     def find_dont_battle_return(self):
         """判断是否有返回按钮"""
-        return_button = self.find_template("return-1.png")
+        return_button = self.find_template("return-1.png", use_gray=False)
         if return_button:
             self.click(*return_button)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_return(self):
         """判断是否在返回主界面"""
@@ -464,32 +627,32 @@ class GameBot:
 
         if return_button:
             self.click(*return_button)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_stop(self):
         """判断能否发现停止按钮"""
         stop = self.find_template("battling.png")
         if stop:
             self.click(*stop)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_exit(self):
         """判断能否发现退出按钮"""
         exit_button = self.find_template("exit.png")
         if exit_button:
             self.click(*exit_button)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def find_card(self):
         """判断能否发现卡关按钮"""
         card = self.find_template("card-normal.png")
         if card:
             self.click(*card)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
             card = self.find_template("card-start.png")
             if card:
                 self.click(*card)
-                time.sleep(0.2)
+                self.sleep_interruptible(0.2)
 
     def find_orange_start_game(self):
         """判断能否发现橘子开始游戏按钮"""
@@ -497,7 +660,7 @@ class GameBot:
         print(orange_start_game)
         if orange_start_game:
             self.click(*orange_start_game)
-            time.sleep(0.2)
+            self.sleep_interruptible(0.2)
 
     def on_hotkey(self, key):
         """快捷键回调函数"""
@@ -537,7 +700,7 @@ class GameBot:
 
             # 确保游戏窗口被找到
             if not self.game_window and not self.find_game_window():
-                time.sleep(5)
+                self.sleep_interruptible(5)
                 continue
             # 关闭按钮
             self.find_home_close()
@@ -559,7 +722,7 @@ class GameBot:
                     self.find_fullscreen_window()
                     # 检查开始游戏是否可点击
                     self.find_orange_start_game()
-                    time.sleep(10)
+                    self.sleep_interruptible(10)
                     continue
 
                 battling = self.find_battling()
@@ -570,7 +733,7 @@ class GameBot:
                 self.find_skill()
                 # 点击继续战斗
                 self.find_battling_continue()
-                time.sleep(3)
+                self.sleep_interruptible(3)
                 # 点击重新连接
                 self.find_reconnection()
                 # 关闭窗口
