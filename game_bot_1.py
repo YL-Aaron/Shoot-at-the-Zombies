@@ -12,7 +12,10 @@ import cv2
 import numpy as np
 import pyautogui
 from pynput import keyboard
+import win32api
+import win32con
 from win32 import win32gui
+
 
 SKILL_LIST = [
     {"name": "子弹", "template": ["skill.png"]},
@@ -382,10 +385,13 @@ class GameBot:
             duration += random.uniform(-0.1, 0.1)
             duration = max(0.1, duration)
 
-        pyautogui.moveTo(x, y, duration=duration)
+        # SetCursorPos jumps immediately; moveTo(duration=...) creates a visible trail.
+        win32api.SetCursorPos((int(x), int(y)))
         if not self.running:
             return False
-        pyautogui.click()
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         print(f"点击位置: ({x}, {y})")
         return True
 
@@ -393,10 +399,13 @@ class GameBot:
         """Fast click only while the bot is still running."""
         if not self.running:
             return False
-        pyautogui.moveTo(x, y, duration=0)
+        win32api.SetCursorPos((int(x), int(y)))
+        time.sleep(0.015)
         if not self.running:
             return False
-        pyautogui.click()
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         print(f"快速点击位置: ({x}, {y})")
         return True
 
@@ -468,13 +477,14 @@ class GameBot:
                             if not self.running:
                                 break
                             self.click_fast(join_x, y)
+                            self.sleep_interruptible(0.05)
                     else:
                         print("未找到环球按钮")
-                        self.sleep_interruptible(0.1)  # 减少等待时间
+                        self.sleep_interruptible(0.03)  # 减少等待时间
                 except Exception as e:
                     print("查找环球按钮时出错:", e)
                     traceback.print_exc()
-                    self.sleep_interruptible(0.1)  # 减少等待时间
+                    self.sleep_interruptible(0.03)  # 减少等待时间
                 else:
                     print("未找到招募页面")
 
