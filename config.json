@@ -1,9 +1,11 @@
 {
   "priority_skills": [
+    "矩阵",
     "温压弹",
     "子弹",
     "干冰弹",
-    "电",
     "冰雹"
-  ]
+  ],
+  "group_wait_timeout": 30,
+  "exit_deep_abyss": true
 }
