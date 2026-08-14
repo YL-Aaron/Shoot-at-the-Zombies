@@ -17,6 +17,19 @@ import win32con
 from win32 import win32gui
 
 
+def resource_path(relative_path):
+    """返回源码目录或 PyInstaller 单文件解压目录中的资源路径。"""
+    base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, relative_path)
+
+
+def config_path():
+    """开发时使用项目配置；打包后将用户配置保存在 EXE 同级目录。"""
+    if not getattr(sys, 'frozen', False):
+        return resource_path("config.json")
+    return os.path.join(os.path.dirname(sys.executable), "config.json")
+
+
 SKILL_LIST = [
     {'name': '矩阵', 'template': ['skill-jz.png']},
     {"name": "子弹", "template": ["skill.png"]},
@@ -58,13 +71,8 @@ class GameBot:
         self.screenshot_dir = "screenshots"
         self.priority_skills = priority_skills if priority_skills else []
 
-        # 获取templates目录路径（支持PyInstaller打包后的路径）
-        if getattr(sys, 'frozen', False):
-            # 如果是打包后的exe文件
-            self.template_dir = os.path.join(os.path.dirname(sys.executable), "templates")
-        else:
-            # 如果是开发环境
-            self.template_dir = "templates"
+        # 单文件打包时，PyInstaller 会将内置模板解压到临时资源目录。
+        self.template_dir = resource_path("templates")
 
         self.mode = mode
 
@@ -575,6 +583,17 @@ class GameBot:
                 self.sleep_interruptible(0.05)
         return False
 
+    def confirm_solo_huanqiu_team(self, confirmations=3, interval=0.3):
+        """连续确认寰球队伍中仍显示招募入口，即当前只有自己。"""
+        for attempt in range(confirmations):
+            if not self.running:
+                return False
+            if not self.find_in_huanqiu_team() or not self.find_team_up():
+                return False
+            if attempt < confirmations - 1:
+                self.sleep_interruptible(interval)
+        return True
+
     def find_normal_stage_team(self):
         if not self.game_window:
             return False
@@ -1083,6 +1102,12 @@ class GameBot:
                     continue
                 if in_huanqiu_team:
                     self.exit_normal_stage = False
+                    if self.confirm_solo_huanqiu_team():
+                        print('连续确认寰球队伍中只有自己，立即退出后重新招募')
+                        self.group_wait_started_at = None
+                        self.find_dont_battle_return()
+                        self.find_click_continue()
+                        continue
 
             # 先确定位置
             start_button = self.find_start_button()
@@ -1135,8 +1160,6 @@ class GameBot:
 
 
 class GameBotGUI:
-    CONFIG_FILE = "config.json"
-
     def __init__(self, root):
         self.root = root
         self.root.title("游戏机器人操作界面")
@@ -1145,6 +1168,7 @@ class GameBotGUI:
 
         self.bot = None
         self.is_running = False
+        self.config_file = config_path()
 
         # 创建界面组件
         self.create_widgets()
@@ -1162,8 +1186,12 @@ class GameBotGUI:
     def load_config(self):
         """加载保存的配置"""
         try:
-            if os.path.exists(self.CONFIG_FILE):
-                with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
+            # 首次运行 EXE 时读取内置默认配置；保存后读取用户配置。
+            load_path = self.config_file
+            if not os.path.exists(load_path):
+                load_path = resource_path("config.json")
+            if os.path.exists(load_path):
+                with open(load_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     self.group_wait_timeout_var.set(
                         config.get('group_wait_timeout', 30)
@@ -1187,7 +1215,7 @@ class GameBotGUI:
                 'group_wait_timeout': self.group_wait_timeout_var.get(),
                 'exit_deep_abyss': self.exit_deep_abyss_var.get(),
             }
-            with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存配置失败: {e}")

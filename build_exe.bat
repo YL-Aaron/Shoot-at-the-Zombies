@@ -1,10 +1,13 @@
 @echo off
+chcp 65001 >nul
 echo 开始打包游戏机器人...
 echo.
 
 REM 使用PyInstaller打包，--windowed表示不显示控制台窗口，--onefile表示生成单个exe文件
-REM --add-data参数用于包含templates目录，格式为 "源路径;目标路径"
-pyinstaller --onefile --name="游戏机器人" --add-data "templates;templates" game_bot.py
+REM 将模板和默认配置一并嵌入单文件EXE
+set "PYINSTALLER=.venv\Scripts\pyinstaller.exe"
+if not exist "%PYINSTALLER%" set "PYINSTALLER=pyinstaller"
+"%PYINSTALLER%" --clean --noconfirm --onefile --name="游戏机器人" --add-data "templates;templates" --add-data "config.json;." game_bot.py
 
 echo.
 echo 打包完成！
