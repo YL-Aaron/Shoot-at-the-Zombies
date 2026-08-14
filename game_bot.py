@@ -61,6 +61,8 @@ class GameBot:
         self.group_wait_started_at = None
         self.exit_deep_abyss = False
         self.exit_normal_stage = False
+        self.exit_normal_stage_on_huanqiu = True
+        self.expecting_huanqiu_battle = False
         self.hotkey_listener = None
         self.sct = mss.mss()
         """初始化游戏机器人"""
@@ -1028,6 +1030,7 @@ class GameBot:
             self.find_return()
 
             batileTime = None
+            battle_seen = False
             # 是不是在战斗中
             while True and self.running:
 
@@ -1042,11 +1045,20 @@ class GameBot:
                 if not battling:
                     break
                 self.group_wait_started_at = None
-                if self.mode == 0 and self.exit_normal_stage:
-                    print('已确认误入普通关卡，正在退出战斗')
+                battle_seen = True
+                if (
+                    self.mode == 0
+                    and self.exit_normal_stage_on_huanqiu
+                    and (
+                        self.exit_normal_stage
+                        or not self.expecting_huanqiu_battle
+                    )
+                ):
+                    print('打寰球过程中检测到误入普通关卡，正在退出战斗')
                     self.find_stop()
                     if self.find_exit():
                         self.exit_normal_stage = False
+                        self.expecting_huanqiu_battle = False
                     break
                 if self.exit_deep_abyss and self.find_deep_abyss():
                     print('检测到深渊同行，正在退出战斗')
@@ -1074,6 +1086,8 @@ class GameBot:
                         self.find_stop()
                         self.find_exit()
                 print("战斗时间:", time.time() - batileTime)
+            if battle_seen:
+                self.expecting_huanqiu_battle = False
             # 是否刷环球
             if self.mode == 0:
                 battling = self.find_battling()
@@ -1086,25 +1100,33 @@ class GameBot:
                 in_huanqiu_team = self.find_in_huanqiu_team()
                 team_up = self.find_team_up()
                 normal_stage_team = self.find_normal_stage_team()
-                if normal_stage_team and not in_huanqiu_team:
+                if (
+                    self.exit_normal_stage_on_huanqiu
+                    and normal_stage_team
+                    and not in_huanqiu_team
+                ):
                     print('明确识别到普通关卡准备界面，正在返回招募频道')
                     self.exit_normal_stage = True
+                    self.expecting_huanqiu_battle = False
                     self.group_wait_started_at = None
                     exited_team = self.find_dont_battle_return()
                     if exited_team:
                         self.find_click_continue()
+                        self.exit_normal_stage = False
                     elif self.find_im():
                         self.find_recruitment()
-                    else:
-                        self.sleep_interruptible(1)
-                    if not self.find_battling():
                         self.exit_normal_stage = False
+                    else:
+                        # 可能已经进入加载或战斗，保留标记给战斗循环处理。
+                        self.sleep_interruptible(1)
                     continue
                 if in_huanqiu_team:
                     self.exit_normal_stage = False
+                    self.expecting_huanqiu_battle = True
                     if self.confirm_solo_huanqiu_team():
                         print('连续确认寰球队伍中只有自己，立即退出后重新招募')
                         self.group_wait_started_at = None
+                        self.expecting_huanqiu_battle = False
                         self.find_dont_battle_return()
                         self.find_click_continue()
                         continue
@@ -1126,6 +1148,7 @@ class GameBot:
                     ):
                         print(f'组队等待超过{self.group_wait_timeout}秒，退出后重新招募')
                         self.group_wait_started_at = None
+                        self.expecting_huanqiu_battle = False
                         self.find_dont_battle_return()
                         self.find_click_continue()
                         continue
@@ -1199,6 +1222,9 @@ class GameBotGUI:
                     self.exit_deep_abyss_var.set(
                         config.get('exit_deep_abyss', False)
                     )
+                    self.exit_normal_stage_var.set(
+                        config.get('exit_normal_stage_on_huanqiu', True)
+                    )
                     # 加载优先技能配置
                     priority_skills = config.get('priority_skills', [])
                     for i, skill_name in enumerate(priority_skills):
@@ -1214,6 +1240,9 @@ class GameBotGUI:
                 'priority_skills': [var.get() for var in self.priority_skill_vars],
                 'group_wait_timeout': self.group_wait_timeout_var.get(),
                 'exit_deep_abyss': self.exit_deep_abyss_var.get(),
+                'exit_normal_stage_on_huanqiu': (
+                    self.exit_normal_stage_var.get()
+                ),
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -1316,6 +1345,13 @@ class GameBotGUI:
             variable=self.exit_deep_abyss_var,
         ).grid(row=13, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
 
+        self.exit_normal_stage_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            self.root,
+            text='打寰球时误入普通关卡自动退出',
+            variable=self.exit_normal_stage_var,
+        ).grid(row=14, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
+
     def on_skill_selected(self, event):
         """技能选择事件，防止重复选择"""
         # 获取所有已选择的技能
@@ -1341,6 +1377,7 @@ class GameBotGUI:
             battle_time = self.battle_time_var.get()
             group_wait_timeout = max(0, self.group_wait_timeout_var.get())
             exit_deep_abyss = self.exit_deep_abyss_var.get()
+            exit_normal_stage = self.exit_normal_stage_var.get()
 
             # 获取5个优先技能（将中文名称转换为模板文件名）
             priority_skills = []
@@ -1363,6 +1400,7 @@ class GameBotGUI:
             self.bot = GameBot(game_title, battle_time, battle_count, mode, priority_skills)
             self.bot.group_wait_timeout = group_wait_timeout
             self.bot.exit_deep_abyss = exit_deep_abyss
+            self.bot.exit_normal_stage_on_huanqiu = exit_normal_stage
 
             # 更新状态
             self.status_var.set("运行中...")
