@@ -63,6 +63,8 @@ class GameBot:
         self.exit_normal_stage = False
         self.exit_normal_stage_on_huanqiu = True
         self.expecting_huanqiu_battle = False
+        self.initial_skill_check_deadline = None
+        self.battle_identify_not_before = None
         self.hotkey_listener = None
         self.sct = mss.mss()
         """初始化游戏机器人"""
@@ -910,6 +912,102 @@ class GameBot:
         horizontal_gap = suffix[0] - prefix[0]
         return 25 <= horizontal_gap <= 70 and abs(suffix[1] - prefix[1]) <= 12
 
+    def find_huanqiu_battle_title(self, roi):
+        '''对战斗页标题进行彩色多尺度匹配，兼容不同窗口缩放。'''
+        frame = self.take_screenshot()
+        if frame is None:
+            return False
+        roi_x, roi_y, roi_width, roi_height = roi
+        title_frame = frame[
+            roi_y:roi_y + roi_height,
+            roi_x:roi_x + roi_width,
+        ]
+        if not hasattr(self, '_template_cache'):
+            self._template_cache = {}
+        best_score = 0.0
+        for template_name in [
+            'in-huanqiu-team.png',
+            'huanqiu-team-title.png',
+        ]:
+            template_key = ('huanqiu-battle-original', template_name)
+            if template_key not in self._template_cache:
+                template = cv2.imread(
+                    os.path.join(self.template_dir, template_name),
+                    cv2.IMREAD_COLOR,
+                )
+                if template is None:
+                    continue
+                self._template_cache[template_key] = template
+            template = self._template_cache[template_key]
+            for scale_percent in range(45, 106, 3):
+                scale_key = (
+                    'huanqiu-battle-scaled',
+                    template_name,
+                    scale_percent,
+                )
+                if scale_key not in self._template_cache:
+                    scale = scale_percent / 100
+                    self._template_cache[scale_key] = cv2.resize(
+                        template,
+                        None,
+                        fx=scale,
+                        fy=scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                scaled = self._template_cache[scale_key]
+                height, width = scaled.shape[:2]
+                if height > title_frame.shape[0] or width > title_frame.shape[1]:
+                    continue
+                result = cv2.matchTemplate(
+                    title_frame,
+                    scaled,
+                    cv2.TM_CCOEFF_NORMED,
+                )
+                _, score, _, _ = cv2.minMaxLoc(result)
+                best_score = max(best_score, float(score))
+                if score >= 0.68:
+                    return True
+        self.last_huanqiu_battle_score = best_score
+        return False
+
+    def find_huanqiu_battle(self):
+        '''在战斗页顶部再次确认是否显示寰球救援标题。'''
+        if not self.game_window:
+            return False
+        _, _, window_width, window_height = self.game_window
+        top_roi = (0, 0, window_width, int(window_height * 0.24))
+        for attempt in range(3):
+            if self.find_huanqiu_battle_title(top_roi):
+                return True
+            if self.find_template(
+                [
+                    'huanqiu-team-title.png',
+                    'in-huanqiu-team.png',
+                    'huanqiu2.png',
+                    'huanqiu.png',
+                    'huanqiu1.png',
+                ],
+                threshold=0.68,
+                use_gray=False,
+                roi=top_roi,
+            ):
+                return True
+            if attempt < 2:
+                self.sleep_interruptible(0.1)
+        return False
+
+    def dismiss_activated_skill_page(self):
+        '''识别“已激活技能”页，并点击弹窗上方空白处关闭。'''
+        if not self.game_window:
+            return False
+        auto_close = self.find_template('auto-close.png', threshold=0.75)
+        if not auto_close:
+            return False
+        left, top, width, height = self.game_window
+        self.click(left + width // 2, top + int(height * 0.18))
+        self.sleep_interruptible(0.3)
+        return True
+
     def find_battling(self):
         """判断是否在战斗中"""
         xy = self.find_template("battling.png")
@@ -1046,6 +1144,36 @@ class GameBot:
                     break
                 self.group_wait_started_at = None
                 battle_seen = True
+                if self.initial_skill_check_deadline is None:
+                    self.initial_skill_check_deadline = time.time() + 15
+                    self.battle_identify_not_before = time.time() + 2
+                    print('已进入战斗，将在前15秒检测可能出现的初始技能页')
+                if time.time() < self.initial_skill_check_deadline:
+                    if self.dismiss_activated_skill_page():
+                        print('已关闭“已激活技能”页，等待战斗界面稳定')
+                        self.battle_identify_not_before = time.time() + 2
+                        self.sleep_interruptible(0.5)
+                        continue
+                    skill_selected = self.find_skill()
+                    if skill_selected:
+                        print('已处理普通技能选择页，等待页面消失后再判断关卡')
+                        self.battle_identify_not_before = time.time() + 1.2
+                        self.sleep_interruptible(0.5)
+                        continue
+                    if time.time() < self.battle_identify_not_before:
+                        self.sleep_interruptible(0.2)
+                        continue
+
+                if (
+                    self.mode == 0
+                    and self.exit_normal_stage_on_huanqiu
+                    and (self.exit_normal_stage or not self.expecting_huanqiu_battle)
+                    and self.find_huanqiu_battle()
+                ):
+                    print('已在战斗页确认是寰球远征，取消普通关卡退出')
+                    self.exit_normal_stage = False
+                    self.expecting_huanqiu_battle = True
+
                 if (
                     self.mode == 0
                     and self.exit_normal_stage_on_huanqiu
@@ -1086,8 +1214,6 @@ class GameBot:
                         self.find_stop()
                         self.find_exit()
                 print("战斗时间:", time.time() - batileTime)
-            if battle_seen:
-                self.expecting_huanqiu_battle = False
             # 是否刷环球
             if self.mode == 0:
                 battling = self.find_battling()
@@ -1100,6 +1226,10 @@ class GameBot:
                 in_huanqiu_team = self.find_in_huanqiu_team()
                 team_up = self.find_team_up()
                 normal_stage_team = self.find_normal_stage_team()
+                if team_up or normal_stage_team:
+                    self.initial_skill_check_deadline = None
+                    self.battle_identify_not_before = None
+
                 if (
                     self.exit_normal_stage_on_huanqiu
                     and normal_stage_team
