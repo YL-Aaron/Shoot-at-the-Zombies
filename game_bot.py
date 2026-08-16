@@ -587,12 +587,30 @@ class GameBot:
                 self.sleep_interruptible(0.05)
         return False
 
+    def find_huanqiu_solo_invite(self):
+        '''识别寰球队伍右下方的“+邀请”空位，即当前只有自己。'''
+        if not self.game_window:
+            return False
+        _, _, window_width, window_height = self.game_window
+        invite_roi = (
+            int(window_width * 0.45),
+            int(window_height * 0.70),
+            int(window_width * 0.55),
+            int(window_height * 0.20),
+        )
+        return self.find_template(
+            'huanqiu-solo-invite.png',
+            threshold=0.72,
+            use_gray=False,
+            roi=invite_roi,
+        )
+
     def confirm_solo_huanqiu_team(self, confirmations=3, interval=0.3):
-        """连续确认寰球队伍中仍显示招募入口，即当前只有自己。"""
+        """连续确认寰球队伍中仍显示“+邀请”空位，即当前只有自己。"""
         for attempt in range(confirmations):
             if not self.running:
                 return False
-            if not self.find_in_huanqiu_team() or not self.find_team_up():
+            if not self.find_in_huanqiu_team() or not self.find_huanqiu_solo_invite():
                 return False
             if attempt < confirmations - 1:
                 self.sleep_interruptible(interval)
@@ -856,7 +874,7 @@ class GameBot:
         elif is_second_bullet:
             threshold = 0.72
         else:
-            threshold = 0.78
+            threshold = 0.86
         best = None
         for scale in (0.92, 1.0, 1.08):
             scaled = template if scale == 1.0 else cv2.resize(
@@ -1235,20 +1253,31 @@ class GameBot:
                     and normal_stage_team
                     and not in_huanqiu_team
                 ):
-                    print('明确识别到普通关卡准备界面，正在返回招募频道')
+                    print('明确识别到普通关卡准备界面，正在判断是否已组队')
                     self.exit_normal_stage = True
                     self.expecting_huanqiu_battle = False
                     self.group_wait_started_at = None
                     exited_team = self.find_dont_battle_return()
                     if exited_team:
+                        print('已发现退出队伍按钮，正在退出当前队伍')
                         self.find_click_continue()
                         self.exit_normal_stage = False
-                    elif self.find_im():
-                        self.find_recruitment()
-                        self.exit_normal_stage = False
+                        self.sleep_interruptible(0.5)
                     else:
-                        # 可能已经进入加载或战斗，保留标记给战斗循环处理。
-                        self.sleep_interruptible(1)
+                        normal_start_button = self.find_template('battle.png')
+                        if not normal_start_button:
+                            normal_start_button = self.find_template(
+                                'battle-1.png',
+                                threshold=0.7,
+                            )
+                        if normal_start_button:
+                            print('当前未组队，正在返回寰球招募频道')
+                            if self.find_im():
+                                self.find_recruitment()
+                                self.exit_normal_stage = False
+                            else:
+                                print('等待招募频道入口出现')
+                                self.sleep_interruptible(0.5)
                     continue
                 if in_huanqiu_team:
                     self.exit_normal_stage = False
