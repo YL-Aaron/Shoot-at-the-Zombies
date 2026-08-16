@@ -8,5 +8,6 @@
   ],
   "group_wait_timeout": 30,
   "exit_deep_abyss": true,
-  "exit_normal_stage_on_huanqiu": true
+  "exit_normal_stage_on_huanqiu": true,
+  "prioritize_biochemical_bullet": true
 }

@@ -62,6 +62,7 @@ class GameBot:
         self.exit_deep_abyss = False
         self.exit_normal_stage = False
         self.exit_normal_stage_on_huanqiu = True
+        self.prioritize_biochemical_bullet = True
         self.expecting_huanqiu_battle = False
         self.initial_skill_check_deadline = None
         self.battle_identify_not_before = None
@@ -811,6 +812,25 @@ class GameBot:
         if frame is None:
             return None
         _, _, window_width, window_height = self.game_window
+        if self.prioritize_biochemical_bullet:
+            biochemical_roi = (
+                0,
+                int(window_height * 0.35),
+                window_width,
+                int(window_height * 0.12),
+            )
+            biochemical_bullet = self.find_template(
+                'skill-biochemical-bullet-title.png',
+                threshold=0.82,
+                use_gray=False,
+                roi=biochemical_roi,
+            )
+            if biochemical_bullet:
+                print('检测到生化子弹，忽略技能优先级顺序并直接选择')
+                self.click(*biochemical_bullet)
+                self.sleep_interruptible(0.2)
+                return True
+
         roi_y = int(window_height * 0.39)
         roi_height = int(window_height * 0.22)
         skill_frame = frame[roi_y:roi_y + roi_height, 0:window_width]
@@ -1345,7 +1365,7 @@ class GameBotGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("游戏机器人操作界面")
-        self.root.geometry("600x750")
+        self.root.geometry("600x790")
         self.root.resizable(False, False)
 
         self.bot = None
@@ -1384,6 +1404,9 @@ class GameBotGUI:
                     self.exit_normal_stage_var.set(
                         config.get('exit_normal_stage_on_huanqiu', True)
                     )
+                    self.prioritize_biochemical_bullet_var.set(
+                        config.get('prioritize_biochemical_bullet', True)
+                    )
                     # 加载优先技能配置
                     priority_skills = config.get('priority_skills', [])
                     for i, skill_name in enumerate(priority_skills):
@@ -1402,6 +1425,10 @@ class GameBotGUI:
                 'exit_normal_stage_on_huanqiu': (
                     self.exit_normal_stage_var.get()
                 ),
+                'prioritize_biochemical_bullet': (
+                    self.prioritize_biochemical_bullet_var.get()
+                ),
+
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -1510,6 +1537,13 @@ class GameBotGUI:
             text='打寰球时误入普通关卡自动退出',
             variable=self.exit_normal_stage_var,
         ).grid(row=14, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
+        self.prioritize_biochemical_bullet_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            self.root,
+            text='生化子弹出现时无视技能优先级',
+            variable=self.prioritize_biochemical_bullet_var,
+        ).grid(row=15, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
+
 
     def on_skill_selected(self, event):
         """技能选择事件，防止重复选择"""
@@ -1537,6 +1571,7 @@ class GameBotGUI:
             group_wait_timeout = max(0, self.group_wait_timeout_var.get())
             exit_deep_abyss = self.exit_deep_abyss_var.get()
             exit_normal_stage = self.exit_normal_stage_var.get()
+            prioritize_biochemical_bullet = self.prioritize_biochemical_bullet_var.get()
 
             # 获取5个优先技能（将中文名称转换为模板文件名）
             priority_skills = []
@@ -1560,6 +1595,7 @@ class GameBotGUI:
             self.bot.group_wait_timeout = group_wait_timeout
             self.bot.exit_deep_abyss = exit_deep_abyss
             self.bot.exit_normal_stage_on_huanqiu = exit_normal_stage
+            self.bot.prioritize_biochemical_bullet = prioritize_biochemical_bullet
 
             # 更新状态
             self.status_var.set("运行中...")
