@@ -892,6 +892,15 @@ class GameBot:
             return True
         return None
 
+    def handle_battle_skill_page(self):
+        '''Handle a skill page before making any battle-type decision.'''
+        if not self.find_skill():
+            return False
+        print('已处理普通技能选择页，继续判断战斗关卡')
+        self.battle_identify_not_before = time.time() + 1.2
+        self.sleep_interruptible(0.5)
+        return True
+
     def match_skill_template(self, skill_frame, template_name):
         '''彩色多尺度匹配技能，返回分数及相对中心坐标。'''
         if not hasattr(self, '_template_cache'):
@@ -1221,31 +1230,44 @@ class GameBot:
                     self.initial_skill_check_deadline = time.time() + 15
                     self.battle_identify_not_before = time.time() + 2
                     print('已进入战斗，将在前15秒检测可能出现的初始技能页')
-                if time.time() < self.initial_skill_check_deadline:
-                    if self.dismiss_activated_skill_page():
-                        print('已关闭“已激活技能”页，等待战斗界面稳定')
-                        self.battle_identify_not_before = time.time() + 2
-                        self.sleep_interruptible(0.5)
-                        continue
-                    skill_selected = self.find_skill()
-                    if skill_selected:
-                        print('已处理普通技能选择页，等待页面消失后再判断关卡')
-                        self.battle_identify_not_before = time.time() + 1.2
-                        self.sleep_interruptible(0.5)
-                        continue
-                    if time.time() < self.battle_identify_not_before:
-                        self.sleep_interruptible(0.2)
-                        continue
-
+                initial_skill_window = (
+                    time.time() < self.initial_skill_check_deadline
+                )
                 if (
+                    initial_skill_window
+                    and self.dismiss_activated_skill_page()
+                ):
+                    print('已关闭“已激活技能”页，等待战斗界面稳定')
+                    self.battle_identify_not_before = time.time() + 2
+                    self.sleep_interruptible(0.5)
+                    continue
+
+                # Skill pages can also appear after the initial 15 seconds.
+                if self.handle_battle_skill_page():
+                    continue
+                if (
+                    initial_skill_window
+                    and time.time() < self.battle_identify_not_before
+                ):
+                    self.sleep_interruptible(0.2)
+                    continue
+
+                should_identify_huanqiu = (
                     self.mode == 0
                     and self.exit_normal_stage_on_huanqiu
-                    and (self.exit_normal_stage or not self.expecting_huanqiu_battle)
-                    and self.find_huanqiu_battle()
-                ):
-                    print('已在战斗页确认是寰球远征，取消普通关卡退出')
-                    self.exit_normal_stage = False
-                    self.expecting_huanqiu_battle = True
+                    and (
+                        self.exit_normal_stage
+                        or not self.expecting_huanqiu_battle
+                    )
+                )
+                if should_identify_huanqiu:
+                    if self.find_huanqiu_battle():
+                        print('已在战斗页确认是寰球远征，取消普通关卡退出')
+                        self.exit_normal_stage = False
+                        self.expecting_huanqiu_battle = True
+                    elif self.handle_battle_skill_page():
+                        print('判断寰球期间出现技能选择页，已处理后重新判断')
+                        continue
 
                 if (
                     self.mode == 0
