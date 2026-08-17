@@ -907,15 +907,31 @@ class GameBot:
             self._template_cache[cache_key] = template
         template = self._template_cache[cache_key]
         is_small_template = max(template.shape[:2]) <= 40
-        is_second_bullet = template_name.startswith('skill-1')
         if is_small_template:
             threshold = 0.86
-        elif is_second_bullet:
-            threshold = 0.72
         else:
-            threshold = 0.86
+            # Ignore the shared pale gear background around large skill icons.
+            crop_key = ('skill-icon-crop', template_name)
+            if crop_key not in self._template_cache:
+                saturation = cv2.cvtColor(
+                    template,
+                    cv2.COLOR_BGR2HSV,
+                )[:, :, 1]
+                ys, xs = np.where(saturation >= 55)
+                if len(xs) >= 20:
+                    margin = 3
+                    x1 = max(0, int(xs.min()) - margin)
+                    x2 = min(template.shape[1], int(xs.max()) + margin + 1)
+                    y1 = max(0, int(ys.min()) - margin)
+                    y2 = min(template.shape[0], int(ys.max()) + margin + 1)
+                    icon_template = template[y1:y2, x1:x2]
+                else:
+                    icon_template = template
+                self._template_cache[crop_key] = icon_template
+            template = self._template_cache[crop_key]
+            threshold = 0.78
         best = None
-        for scale in (0.92, 1.0, 1.08):
+        for scale in (0.88, 0.92, 0.96, 1.0, 1.04, 1.08, 1.12):
             scaled = template if scale == 1.0 else cv2.resize(
                 template,
                 None,
