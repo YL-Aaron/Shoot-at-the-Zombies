@@ -625,9 +625,9 @@ class GameBot:
         _, _, window_width, window_height = self.game_window
         tabs_roi = (
             0,
-            int(window_height * 0.20),
+            int(window_height * 0.16),
             window_width,
-            int(window_height * 0.12),
+            int(window_height * 0.22),
         )
         frame = self.take_screenshot()
         if frame is None:
@@ -661,22 +661,41 @@ class GameBot:
                     160,
                 )
             edge_template = self._template_cache[cache_key]
-            result = cv2.matchTemplate(
-                tabs_edges,
-                edge_template,
-                cv2.TM_CCOEFF_NORMED,
-            )
-            _, score, _, location = cv2.minMaxLoc(result)
-            if score < 0.60:
+            best_match = None
+            # Support normal-stage tabs when the game window is scaled.
+            for scale_percent in range(70, 141, 5):
+                scale = scale_percent / 100
+                scaled = edge_template if scale_percent == 100 else cv2.resize(
+                    edge_template,
+                    None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=(
+                        cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+                    ),
+                )
+                height, width = scaled.shape[:2]
+                if height > tabs_edges.shape[0] or width > tabs_edges.shape[1]:
+                    continue
+                result = cv2.matchTemplate(
+                    tabs_edges,
+                    scaled,
+                    cv2.TM_CCOEFF_NORMED,
+                )
+                _, score, _, location = cv2.minMaxLoc(result)
+                if best_match is None or score > best_match[0]:
+                    best_match = (float(score), location, width, height)
+            if best_match is None or best_match[0] < 0.55:
                 return False
+            _, location, width, height = best_match
             centers.append((
-                location[0] + edge_template.shape[1] // 2,
-                location[1] + edge_template.shape[0] // 2,
+                location[0] + width // 2,
+                location[1] + height // 2,
             ))
         horizontal_gap = centers[1][0] - centers[0][0]
         return (
-            80 <= horizontal_gap <= 180
-            and abs(centers[1][1] - centers[0][1]) <= 12
+            int(window_width * 0.05) <= horizontal_gap <= int(window_width * 0.24)
+            and abs(centers[1][1] - centers[0][1]) <= int(window_height * 0.025)
         )
         # else:
         #     leave = self.find_template("leave.png")
@@ -821,7 +840,7 @@ class GameBot:
             )
             biochemical_bullet = self.find_template(
                 'skill-biochemical-bullet-title.png',
-                threshold=0.82,
+                threshold=0.92,
                 use_gray=False,
                 roi=biochemical_roi,
             )
@@ -1263,7 +1282,10 @@ class GameBot:
                 # 是否已经进入环球队伍
                 in_huanqiu_team = self.find_in_huanqiu_team()
                 team_up = self.find_team_up()
-                normal_stage_team = self.find_normal_stage_team()
+                normal_stage_team = (
+                    self.find_normal_stage_team()
+                    or (team_up and not in_huanqiu_team)
+                )
                 if team_up or normal_stage_team:
                     self.initial_skill_check_deadline = None
                     self.battle_identify_not_before = None
