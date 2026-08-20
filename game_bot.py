@@ -467,7 +467,6 @@ class GameBot:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.02)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        print(f"快速点击位置: ({x}, {y})")
         return True
 
     def press_key(self, key, presses=1, interval=0.1, human_like=True):
@@ -508,6 +507,10 @@ class GameBot:
             if team_up:
                 return True
             if not team_up:
+                # 普通关卡准备页也可能露出“招募”入口。此时必须先退出
+                # 当前普通队伍，不能直接点击招募切走页面。
+                if self.find_normal_stage_team():
+                    return False
                 xy = self.find_template("recruitment.png")
                 if not xy:
                     xy = self.find_template("recruitment-1.png")
@@ -864,11 +867,50 @@ class GameBot:
                     best = match
             return best
 
+        # A battle frame can occasionally contain a projectile or HUD icon that
+        # resembles one skill template. A real skill-selection page contains
+        # multiple choices laid out side by side, so require that page structure
+        # before clicking. This prevents one false match from repeatedly entering
+        # handle_battle_skill_page() and flooding the log.
+        page_matches = []
+        for skill in SKILL_LIST:
+            match = best_match(skill['template'])
+            if match:
+                page_matches.append((skill['name'], match))
+
+        has_skill_page_layout = any(
+            abs(first[1][1] - second[1][1]) >= window_width * 0.18
+            and abs(first[1][2] - second[1][2]) <= roi_height * 0.35
+            for index, first in enumerate(page_matches)
+            for second in page_matches[index + 1:]
+        )
+        if not has_skill_page_layout:
+            return None
+
+        def is_best_local_label(match):
+            score, x, y = match
+            nearby_scores = [
+                other_match[0]
+                for _, other_match in page_matches
+                if abs(other_match[1] - x) <= window_width * 0.10
+                and abs(other_match[2] - y) <= roi_height * 0.35
+            ]
+            return score >= max(nearby_scores, default=score) - 0.01
+
         # 当前优先级的所有形态一起比较，避免先匹配到相似但错误的图标。
         for template_names in self.priority_skills:
             match = best_match(template_names)
-            if match:
-                _, x, y = match
+            if match and is_best_local_label(match):
+                skill_name = next(
+                    (
+                        skill['name']
+                        for skill in SKILL_LIST
+                        if set(template_names) & set(skill['template'])
+                    ),
+                    '未知技能',
+                )
+                score, x, y = match
+                print(f'识别到技能：{skill_name}（匹配度{score:.2f}），正在选择')
                 self.click(
                     self.game_window[0] + x,
                     self.game_window[1] + roi_y + y,
@@ -877,13 +919,13 @@ class GameBot:
                 return True
 
         # 没有优先技能时选择全局最高分，不再按模板列表顺序命中即点。
-        match = best_match([
-            template_name
-            for skill in SKILL_LIST
-            for template_name in skill['template']
-        ])
-        if match:
-            _, x, y = match
+        if page_matches:
+            skill_name, match = max(
+                page_matches,
+                key=lambda item: item[1][0],
+            )
+            score, x, y = match
+            print(f'识别到技能：{skill_name}（匹配度{score:.2f}），正在选择')
             self.click(
                 self.game_window[0] + x,
                 self.game_window[1] + roi_y + y,
@@ -896,8 +938,11 @@ class GameBot:
         '''Handle a skill page before making any battle-type decision.'''
         if not self.find_skill():
             return False
-        print('已处理普通技能选择页，继续判断战斗关卡')
-        self.battle_identify_not_before = time.time() + 1.2
+        if self.mode == 0 and self.expecting_huanqiu_battle:
+            print('已处理技能选择页，继续寰球远征战斗')
+        else:
+            print('已处理技能选择页，等待继续判断战斗类型')
+        self.battle_identify_not_before = time.time() + 2
         self.sleep_interruptible(0.5)
         return True
 
@@ -1105,11 +1150,16 @@ class GameBot:
 
     def find_dont_battle_return(self):
         """判断是否有返回按钮"""
-        return_button = self.find_template("return-1.png", use_gray=False)
-        if return_button:
-            self.click(*return_button)
-            self.sleep_interruptible(0.2)
-            return True
+        for attempt in range(3):
+            return_button = self.find_template(
+                "return-1.png", threshold=0.72, use_gray=False
+            )
+            if return_button:
+                self.click(*return_button)
+                self.sleep_interruptible(0.2)
+                return True
+            if attempt < 2:
+                self.sleep_interruptible(0.15)
         return False
 
     def find_return(self):
@@ -1211,6 +1261,7 @@ class GameBot:
 
             batileTime = None
             battle_seen = False
+            huanqiu_identify_failures = 0
             # 是不是在战斗中
             while True and self.running:
 
@@ -1244,9 +1295,10 @@ class GameBot:
 
                 # Skill pages can also appear after the initial 15 seconds.
                 if self.handle_battle_skill_page():
+                    huanqiu_identify_failures = 0
                     continue
                 if (
-                    initial_skill_window
+                    self.battle_identify_not_before is not None
                     and time.time() < self.battle_identify_not_before
                 ):
                     self.sleep_interruptible(0.2)
@@ -1262,12 +1314,20 @@ class GameBot:
                 )
                 if should_identify_huanqiu:
                     if self.find_huanqiu_battle():
+                        huanqiu_identify_failures = 0
                         print('已在战斗页确认是寰球远征，取消普通关卡退出')
                         self.exit_normal_stage = False
                         self.expecting_huanqiu_battle = True
                     elif self.handle_battle_skill_page():
+                        huanqiu_identify_failures = 0
                         print('判断寰球期间出现技能选择页，已处理后重新判断')
                         continue
+                    else:
+                        huanqiu_identify_failures += 1
+                        if huanqiu_identify_failures < 3:
+                            print('战斗类型暂未确认，等待画面稳定后重新判断')
+                            self.sleep_interruptible(0.3)
+                            continue
 
                 if (
                     self.mode == 0
@@ -1315,9 +1375,8 @@ class GameBot:
                 if battling:
                     self.running = True
                     continue
-                # 先找是不是在招募中
-                self.find_recruitment()
-                # 是否已经进入环球队伍
+                # 先判断当前队伍类型，再决定是否进入招募，避免普通组队页
+                # 上的招募入口绕过退出队伍流程。
                 in_huanqiu_team = self.find_in_huanqiu_team()
                 team_up = self.find_team_up()
                 normal_stage_team = (
@@ -1344,6 +1403,10 @@ class GameBot:
                         self.exit_normal_stage = False
                         self.sleep_interruptible(0.5)
                     else:
+                        if team_up:
+                            print('已确认在普通队伍中，等待退出按钮后重试')
+                            self.sleep_interruptible(0.3)
+                            continue
                         normal_start_button = self.find_template('battle.png')
                         if not normal_start_button:
                             normal_start_button = self.find_template(
@@ -1368,6 +1431,11 @@ class GameBot:
                         self.expecting_huanqiu_battle = False
                         self.find_dont_battle_return()
                         self.find_click_continue()
+                        continue
+
+                if not team_up and not normal_stage_team:
+                    # 页面变化后在下一轮重新识别，避免使用点击前的旧状态。
+                    if self.find_recruitment():
                         continue
 
             # 先确定位置
