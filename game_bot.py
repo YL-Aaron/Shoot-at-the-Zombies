@@ -834,6 +834,18 @@ class GameBot:
         if frame is None:
             return None
         _, _, window_width, window_height = self.game_window
+
+        # 技能选择页有三块大面积浅色卡片。先做一次低成本页面结构预检，
+        # 战斗画面不满足时立即返回，避免逐个模板匹配造成延迟和特效误判。
+        roi_y = int(window_height * 0.39)
+        roi_height = int(window_height * 0.22)
+        skill_frame = frame[roi_y:roi_y + roi_height, 0:window_width]
+        hsv = cv2.cvtColor(skill_frame, cv2.COLOR_BGR2HSV)
+        card_mask = (hsv[:, :, 2] >= 160) & (hsv[:, :, 1] <= 95)
+        third_ratios = [np.mean(part) for part in np.array_split(card_mask, 3, axis=1)]
+        if np.mean(card_mask) < 0.30 or sum(ratio >= 0.25 for ratio in third_ratios) < 2:
+            return None
+
         if self.prioritize_biochemical_bullet:
             biochemical_roi = (
                 0,
@@ -852,10 +864,6 @@ class GameBot:
                 self.click(*biochemical_bullet)
                 self.sleep_interruptible(0.2)
                 return True
-
-        roi_y = int(window_height * 0.39)
-        roi_height = int(window_height * 0.22)
-        skill_frame = frame[roi_y:roi_y + roi_height, 0:window_width]
 
         def best_match(template_names):
             best = None
@@ -1052,10 +1060,7 @@ class GameBot:
         if not hasattr(self, '_template_cache'):
             self._template_cache = {}
         best_score = 0.0
-        for template_name in [
-            'in-huanqiu-team.png',
-            'huanqiu-team-title.png',
-        ]:
+        for template_name in ['in-huanqiu-team.png']:
             template_key = ('huanqiu-battle-original', template_name)
             if template_key not in self._template_cache:
                 template = cv2.imread(
@@ -1066,7 +1071,7 @@ class GameBot:
                     continue
                 self._template_cache[template_key] = template
             template = self._template_cache[template_key]
-            for scale_percent in range(45, 106, 3):
+            for scale_percent in range(45, 76, 3):
                 scale_key = (
                     'huanqiu-battle-scaled',
                     template_name,
@@ -1092,7 +1097,8 @@ class GameBot:
                 )
                 _, score, _, _ = cv2.minMaxLoc(result)
                 best_score = max(best_score, float(score))
-                if score >= 0.68:
+                if score >= 0.72:
+                    self.last_huanqiu_battle_score = float(score)
                     return True
         self.last_huanqiu_battle_score = best_score
         return False
@@ -1102,26 +1108,19 @@ class GameBot:
         if not self.game_window:
             return False
         _, _, window_width, window_height = self.game_window
-        top_roi = (0, 0, window_width, int(window_height * 0.24))
-        for attempt in range(3):
-            if self.find_huanqiu_battle_title(top_roi):
-                return True
-            if self.find_template(
-                [
-                    'huanqiu-team-title.png',
-                    'in-huanqiu-team.png',
-                    'huanqiu2.png',
-                    'huanqiu.png',
-                    'huanqiu1.png',
-                ],
-                threshold=0.68,
-                use_gray=False,
-                roi=top_roi,
-            ):
-                return True
-            if attempt < 2:
-                self.sleep_interruptible(0.1)
-        return False
+        title_roi = (
+            int(window_width * 0.18),
+            int(window_height * 0.055),
+            int(window_width * 0.64),
+            int(window_height * 0.11),
+        )
+        # 连续两帧确认，避免技能动画或关卡文字造成单帧误命中。
+        for confirmation in range(2):
+            if not self.find_huanqiu_battle_title(title_roi):
+                return False
+            if confirmation == 0:
+                self.sleep_interruptible(0.08)
+        return True
 
     def dismiss_activated_skill_page(self):
         '''识别“已激活技能”页，并点击弹窗上方空白处关闭。'''
@@ -1315,7 +1314,10 @@ class GameBot:
                 if should_identify_huanqiu:
                     if self.find_huanqiu_battle():
                         huanqiu_identify_failures = 0
-                        print('已在战斗页确认是寰球远征，取消普通关卡退出')
+                        print(
+                            '已在战斗页确认是寰球远征'
+                            f'（匹配度{self.last_huanqiu_battle_score:.2f}），取消普通关卡退出'
+                        )
                         self.exit_normal_stage = False
                         self.expecting_huanqiu_battle = True
                     elif self.handle_battle_skill_page():
