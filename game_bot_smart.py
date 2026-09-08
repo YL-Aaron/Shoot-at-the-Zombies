@@ -1,4 +1,5 @@
 import json
+import ctypes
 import os
 import random
 import sys
@@ -11,10 +12,28 @@ import mss
 import cv2
 import numpy as np
 import pyautogui
+from PIL import Image, ImageDraw, ImageFont
 from pynput import keyboard
 import win32api
 import win32con
 from win32 import win32gui
+
+
+def enable_dpi_awareness():
+    """统一不同 Windows 显示缩放下的截图、窗口和鼠标坐标。"""
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+enable_dpi_awareness()
 
 
 def resource_path(relative_path):
@@ -66,6 +85,7 @@ class GameBot:
         self.expecting_huanqiu_battle = False
         self.initial_skill_check_deadline = None
         self.battle_identify_not_before = None
+        self.invite_retry_not_before = 0
         self.hotkey_listener = None
         self.sct = mss.mss()
         """初始化游戏机器人"""
@@ -143,6 +163,41 @@ class GameBot:
         img = np.array(screenshot)
         return img[:, :, :3]  # BGRA → BGR
 
+    def _primary_template_scale(self):
+        """按游戏窗口宽度估算模板缩放；模板基准截图宽度约为 545。"""
+        if not self.game_window:
+            return 1.0
+        scale = self.game_window[2] / 545.0
+        if abs(scale - 1.0) <= 0.04:
+            return 1.0
+        return min(1.60, max(0.65, scale))
+
+    def _template_scale_candidates(self):
+        primary = self._primary_template_scale()
+        if primary == 1.0:
+            return (1.0,)
+        candidates = [primary, primary * 0.96, primary * 1.04]
+        unique = []
+        for scale in candidates:
+            scale = round(min(1.65, max(0.60, scale)), 3)
+            if scale not in unique:
+                unique.append(scale)
+        return tuple(unique)
+
+    def _scaled_template(self, template_name, use_gray, template, scale):
+        if abs(scale - 1.0) < 0.001:
+            return template
+        cache_key = ('auto-scaled', template_name, use_gray, scale)
+        if cache_key not in self._template_cache:
+            self._template_cache[cache_key] = cv2.resize(
+                template,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+            )
+        return self._template_cache[cache_key]
+
     def find_template(
             self,
             template_names,  # ✅ 支持字符串 或 数组
@@ -178,42 +233,43 @@ class GameBot:
         else:
             offset_x, offset_y = 0, 0
 
-        # ===== 5. 按顺序匹配（命中即返回） =====
+        # ===== 5. 自动适配不同电脑的窗口/DPI缩放 =====
+        best_match = None
         for template_name in template_names:
             template_name = str(template_name)
             cache_key = (template_name, use_gray)
-
-            # ---- 读取 / 缓存模板 ----
             if cache_key not in self._template_cache:
                 template_path = os.path.join(self.template_dir, template_name)
-
-                if use_gray:
-                    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
-                else:
-                    template = cv2.imread(template_path, cv2.IMREAD_COLOR)
-
+                template = cv2.imread(
+                    template_path,
+                    cv2.IMREAD_GRAYSCALE if use_gray else cv2.IMREAD_COLOR,
+                )
                 if template is None:
                     print(f"无法加载模板: {template_path}")
                     continue
-
                 self._template_cache[cache_key] = template
             else:
                 template = self._template_cache[cache_key]
 
-            # ---- 模板匹配 ----
-            result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            for scale in self._template_scale_candidates():
+                scaled = self._scaled_template(
+                    template_name, use_gray, template, scale
+                )
+                height, width = scaled.shape[:2]
+                if height > img.shape[0] or width > img.shape[1]:
+                    continue
+                result = cv2.matchTemplate(img, scaled, cv2.TM_CCOEFF_NORMED)
+                _, score, _, location = cv2.minMaxLoc(result)
+                if best_match is None or score > best_match[0]:
+                    best_match = (float(score), location, width, height)
 
-            # ---- 命中直接返回 ----
-            if max_val >= threshold:
-                h, w = template.shape[:2]
-
-                center_x = self.game_window[0] + offset_x + max_loc[0] + w // 2
-                center_y = self.game_window[1] + offset_y + max_loc[1] + h // 2
-                return center_x, center_y
-
-        # ===== 全部没命中 =====
-        return None
+        if best_match is None or best_match[0] < threshold:
+            return None
+        _, location, width, height = best_match
+        return (
+            self.game_window[0] + offset_x + location[0] + width // 2,
+            self.game_window[1] + offset_y + location[1] + height // 2,
+        )
 
     def find_template1(self, template_name, threshold=0.8):
         # ===== 1. 模板缓存 =====
@@ -380,79 +436,77 @@ class GameBot:
             ]
         else:
             roi_x, roi_y = 0, 0
-        # ===== 3. 彩色模板匹配 =====
-        result = cv2.matchTemplate(img_color, template_color, cv2.TM_CCOEFF_NORMED)
-
-        # ===== 4. 阈值筛选 =====
-        locations = np.where(result >= threshold)
-
-        h, w = template_color.shape[:2]
-
-        # 只检查模板本身有明显颜色的像素。过期招募项会整体变灰，虽然轮廓
-        # 仍能通过相关系数匹配，但这些位置的饱和度会显著降低。
-        color_mask = None
-        template_median_saturation = None
-        if (
-            min_color_saturation is not None
-            or min_template_saturation_ratio is not None
-        ):
-            mask_key = ('color-mask', template_name)
-            median_key = ('median-saturation', template_name)
-            if (
-                mask_key not in self._template_cache
-                or median_key not in self._template_cache
-            ):
-                template_hsv = cv2.cvtColor(template_color, cv2.COLOR_BGR2HSV)
-                color_mask = template_hsv[:, :, 1] >= 80
-                self._template_cache[mask_key] = color_mask
-                self._template_cache[median_key] = float(np.median(
-                    template_hsv[:, :, 1][color_mask]
-                ))
-            color_mask = self._template_cache[mask_key]
-            template_median_saturation = self._template_cache[median_key]
-
+        # ===== 3. 多尺度彩色模板匹配 =====
         boxes = []
         scores = []
+        for scale in self._template_scale_candidates():
+            scaled_template = self._scaled_template(
+                template_name, False, template_color, scale
+            )
+            height, width = scaled_template.shape[:2]
+            if height > img_color.shape[0] or width > img_color.shape[1]:
+                continue
+            result = cv2.matchTemplate(
+                img_color, scaled_template, cv2.TM_CCOEFF_NORMED
+            )
+            locations = np.where(result >= threshold)
 
-        for (y, x) in zip(*locations):
-            if color_mask is not None:
-                matched_patch = img_color[y:y + h, x:x + w]
-                if matched_patch.shape[:2] != (h, w):
-                    continue
-                patch_saturation = cv2.cvtColor(
-                    matched_patch, cv2.COLOR_BGR2HSV
-                )[:, :, 1]
-                if not np.any(color_mask):
-                    continue
-                patch_median_saturation = float(np.median(
-                    patch_saturation[color_mask]
-                ))
-                if (
-                    min_color_saturation is not None
-                    and patch_median_saturation < min_color_saturation
-                ):
-                    continue
-                if (
-                    min_template_saturation_ratio is not None
-                    and patch_median_saturation
-                    < template_median_saturation * min_template_saturation_ratio
-                ):
-                    continue
-            boxes.append([x, y, w, h])
-            scores.append(result[y, x])
+            color_mask = None
+            template_median_saturation = None
+            if (
+                min_color_saturation is not None
+                or min_template_saturation_ratio is not None
+            ):
+                mask_key = ('color-mask-scaled', template_name, scale)
+                median_key = ('median-saturation-scaled', template_name, scale)
+                if mask_key not in self._template_cache:
+                    template_hsv = cv2.cvtColor(
+                        scaled_template, cv2.COLOR_BGR2HSV
+                    )
+                    color_mask = template_hsv[:, :, 1] >= 80
+                    self._template_cache[mask_key] = color_mask
+                    self._template_cache[median_key] = (
+                        float(np.median(template_hsv[:, :, 1][color_mask]))
+                        if np.any(color_mask) else 0.0
+                    )
+                color_mask = self._template_cache[mask_key]
+                template_median_saturation = self._template_cache[median_key]
 
-        # ===== 5. NMS 去重 =====
+            for y, x in zip(*locations):
+                if color_mask is not None:
+                    if not np.any(color_mask):
+                        continue
+                    matched_patch = img_color[y:y + height, x:x + width]
+                    if matched_patch.shape[:2] != (height, width):
+                        continue
+                    patch_saturation = cv2.cvtColor(
+                        matched_patch, cv2.COLOR_BGR2HSV
+                    )[:, :, 1]
+                    patch_median_saturation = float(np.median(
+                        patch_saturation[color_mask]
+                    ))
+                    if (
+                        min_color_saturation is not None
+                        and patch_median_saturation < min_color_saturation
+                    ):
+                        continue
+                    if (
+                        min_template_saturation_ratio is not None
+                        and patch_median_saturation
+                        < template_median_saturation * min_template_saturation_ratio
+                    ):
+                        continue
+                boxes.append([int(x), int(y), int(width), int(height)])
+                scores.append(float(result[y, x]))
+
         indices = cv2.dnn.NMSBoxes(boxes, scores, threshold, 0.3)
-
         matches = []
-
-        for i in indices:
-            x, y, w, h = boxes[i]
-
-            center_x = self.game_window[0] + roi_x + x + w // 2
-            center_y = self.game_window[1] + roi_y + y + h // 2
-
-            matches.append((center_x, center_y))
+        for index in np.array(indices).flatten():
+            x, y, width, height = boxes[int(index)]
+            matches.append((
+                self.game_window[0] + roi_x + x + width // 2,
+                self.game_window[1] + roi_y + y + height // 2,
+            ))
         return matches
 
     def sleep_interruptible(self, seconds, step=0.1):
@@ -806,6 +860,179 @@ class GameBot:
     def find_huanqiu(self):
         """判断能否发现环球按钮"""
         return self.find_template("huanqiu.png")
+
+    @staticmethod
+    def _normalize_digit_mask(mask):
+        ys, xs = np.where(mask > 0)
+        if not len(xs):
+            return None
+        glyph = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        scale = min(16 / glyph.shape[1], 24 / glyph.shape[0])
+        glyph = cv2.resize(
+            glyph, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST
+        )
+        normalized = np.zeros((28, 20), dtype=np.uint8)
+        y = (normalized.shape[0] - glyph.shape[0]) // 2
+        x = (normalized.shape[1] - glyph.shape[1]) // 2
+        normalized[y:y + glyph.shape[0], x:x + glyph.shape[1]] = glyph
+        return normalized
+
+    def _get_invite_digit_templates(self):
+        cache_key = ('invite-digit-templates',)
+        if not hasattr(self, '_template_cache'):
+            self._template_cache = {}
+        if cache_key in self._template_cache:
+            return self._template_cache[cache_key]
+        fonts_dir = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts')
+        font_paths = [os.path.join(fonts_dir, name) for name in [
+            'msyhbd.ttc', 'msyh.ttc', 'simhei.ttf', 'arialbd.ttf'
+        ]]
+        templates = {digit: [] for digit in range(10)}
+        for font_path in font_paths:
+            if not os.path.exists(font_path):
+                continue
+            for size in range(10, 22):
+                font = ImageFont.truetype(font_path, size)
+                for digit in range(10):
+                    canvas = Image.new('L', (40, 40))
+                    ImageDraw.Draw(canvas).text((3, -2), str(digit), font=font, fill=255)
+                    rendered = np.array(canvas)
+                    normalized = self._normalize_digit_mask(
+                        (rendered > 80).astype(np.uint8) * 255
+                    )
+                    if normalized is not None:
+                        templates[digit].append(normalized)
+        for digit in range(10):
+            native_path = os.path.join(
+                self.template_dir, f'invite-digit-{digit}.png'
+            )
+            if not os.path.exists(native_path):
+                continue
+            native = cv2.imread(native_path, cv2.IMREAD_GRAYSCALE)
+            if native is not None:
+                templates[digit].insert(0, native)
+        self._template_cache[cache_key] = templates
+        return templates
+
+    def _read_invite_difficulty(self, frame, label_center):
+        template = self._template_cache.get(
+            ('color', 'team-invite-huanqiu-label.png')
+        )
+        if template is None:
+            return -1
+        left, top, _, _ = self.game_window
+        center_x = int(label_center[0] - left)
+        center_y = int(label_center[1] - top)
+        scale = self._primary_template_scale()
+        digit_x = center_x + int(template.shape[1] * scale) // 2
+        x1, x2 = max(0, digit_x), min(frame.shape[1], digit_x + int(45 * scale))
+        y1 = max(0, center_y - int(12 * scale))
+        y2 = min(frame.shape[0], center_y + int(12 * scale))
+        digit_roi = cv2.cvtColor(
+            frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY
+        )
+        mask = (digit_roi < 150).astype(np.uint8) * 255
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        glyphs = []
+        for x, y, width, height, area in stats[1:count]:
+            if (
+                1 <= width <= int(13 * scale)
+                and int(7 * scale) <= height <= int(17 * scale)
+                and area >= 12 * scale * scale
+            ):
+                glyphs.append((x, mask[y:y + height, x:x + width]))
+        glyphs.sort(key=lambda item: item[0])
+        if not glyphs:
+            return -1
+        digit_templates = self._get_invite_digit_templates()
+        result = []
+        for _, glyph in glyphs[:3]:
+            normalized = self._normalize_digit_mask(glyph)
+            scores = []
+            for digit, candidates in digit_templates.items():
+                if candidates:
+                    score = max(float(cv2.matchTemplate(
+                        normalized, candidate, cv2.TM_CCOEFF_NORMED
+                    )[0, 0]) for candidate in candidates)
+                    scores.append((score, digit))
+            if not scores:
+                return -1
+            score, digit = max(scores)
+            if score < 0.45:
+                return -1
+            result.append(str(digit))
+        return int(''.join(result)) if result else -1
+
+    def _accept_best_huanqiu_invite(self, frame):
+        if not self.game_window:
+            return False
+        _, _, width, height = self.game_window
+        dialog_roi = (int(width * 0.10), int(height * 0.15),
+                      int(width * 0.80), int(height * 0.75))
+        if not self.find_template(
+            'team-invite-title.png', threshold=0.72, use_gray=False,
+            screenshot=frame, roi=dialog_roi,
+        ):
+            return False
+        labels = self.find_all_templates(
+            'team-invite-huanqiu-label.png', threshold=0.70,
+            screenshot=frame, roi=dialog_roi,
+        )
+        if not labels:
+            print('组队邀请中没有寰球救援，暂不接受')
+            left, top, _, _ = self.game_window
+            self.click_fast(left + int(width * 0.92), top + int(height * 0.17))
+            self.invite_retry_not_before = time.time() + 2
+            return True
+        ranked = sorted(
+            ((self._read_invite_difficulty(frame, label), label) for label in labels),
+            key=lambda item: (item[0], -item[1][1]), reverse=True,
+        )
+        difficulty, label = ranked[0]
+        accepts = self.find_all_templates(
+            'team-invite-accept.png', threshold=0.72,
+            screenshot=frame, roi=dialog_roi,
+        )
+        expected_y = label[1] - int(height * 0.055)
+        if accepts:
+            accept = min(accepts, key=lambda point: abs(point[1] - expected_y))
+        else:
+            left, _, _, _ = self.game_window
+            accept = (left + int(width * 0.755), expected_y)
+        difficulty_text = str(difficulty) if difficulty >= 0 else '未识别'
+        print(f'选择寰球救援邀请，难度 {difficulty_text}')
+        self.click_fast(*accept)
+        self.expecting_huanqiu_battle = True
+        self.invite_retry_not_before = time.time() + 1
+        self.sleep_interruptible(0.3)
+        return True
+
+    def handle_dungeon_invite_mode(self):
+        """检查右下角副本邀请，并接受难度最高的寰球救援。"""
+        if self.mode != 3 or time.time() < self.invite_retry_not_before:
+            return False
+        frame = self.take_screenshot()
+        if frame is None:
+            return False
+        if self._accept_best_huanqiu_invite(frame):
+            return True
+        _, _, width, height = self.game_window
+        button_roi = (int(width * 0.68), int(height * 0.70),
+                      int(width * 0.32), int(height * 0.20))
+        button = self.find_template(
+            'dungeon-invite-button.png', threshold=0.70, use_gray=False,
+            screenshot=frame, roi=button_roi,
+        )
+        if not button:
+            return False
+        print('发现副本邀请，正在查看')
+        self.click_fast(*button)
+        self.sleep_interruptible(0.25)
+        frame = self.take_screenshot()
+        if frame is not None and self._accept_best_huanqiu_invite(frame):
+            return True
+        self.invite_retry_not_before = time.time() + 0.5
+        return True
 
     def find_start_button(self):
         """找到战斗位置"""
@@ -1417,6 +1644,10 @@ class GameBot:
             if not self.game_window and not self.find_game_window():
                 self.sleep_interruptible(5)
                 continue
+            # 副本邀请弹窗要在通用关闭逻辑之前处理。
+            if self.handle_dungeon_invite_mode():
+                continue
+
             # 关闭按钮
             self.find_home_close()
 
@@ -1557,6 +1788,11 @@ class GameBot:
                         self.find_stop()
                         self.find_exit()
                 print("战斗时间:", time.time() - batileTime)
+            # 副本邀请模式只等待邀请，不能点击普通关卡的开始按钮。
+            if self.mode == 3:
+                self.sleep_interruptible(0.15)
+                continue
+
             # 是否刷环球
             if self.mode == 0:
                 battling = self.find_battling()
@@ -1715,6 +1951,7 @@ class GameBotGUI:
             if os.path.exists(load_path):
                 with open(load_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
+                    self.mode_var.set(config.get('mode', 0))
                     self.group_wait_timeout_var.set(
                         config.get('group_wait_timeout', 30)
                     )
@@ -1739,6 +1976,7 @@ class GameBotGUI:
         """保存当前配置"""
         try:
             config = {
+                'mode': self.mode_var.get(),
                 'priority_skills': [var.get() for var in self.priority_skill_vars],
                 'group_wait_timeout': self.group_wait_timeout_var.get(),
                 'exit_deep_abyss': self.exit_deep_abyss_var.get(),
@@ -1768,6 +2006,7 @@ class GameBotGUI:
         mode_frame.grid(row=1, column=1, padx=10, pady=5, sticky=tk.W)
         ttk.Radiobutton(mode_frame, text="打环球", variable=self.mode_var, value=0).pack(side=tk.LEFT)
         ttk.Radiobutton(mode_frame, text="刷卡关", variable=self.mode_var, value=1).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="副本邀请", variable=self.mode_var, value=3).pack(side=tk.LEFT)
         # ttk.Radiobutton(mode_frame, text="全屏模式", variable=self.mode_var, value=2).pack(side=tk.LEFT)
 
         # 战斗次数
