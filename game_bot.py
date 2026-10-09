@@ -1123,14 +1123,17 @@ class GameBot:
         return True
 
     def dismiss_activated_skill_page(self):
-        '''识别“已激活技能”页，并点击弹窗上方空白处关闭。'''
+        '''识别“已激活技能”页，点击底部“自动关闭”区域。'''
         if not self.game_window:
             return False
-        auto_close = self.find_template('auto-close.png', threshold=0.75)
+        _, _, width, height = self.game_window
+        auto_close_roi = (0, int(height * 0.85), width, int(height * 0.14))
+        auto_close = self.find_template(
+            'auto-close.png', threshold=0.70, roi=auto_close_roi
+        )
         if not auto_close:
             return False
-        left, top, width, height = self.game_window
-        self.click(left + width // 2, top + int(height * 0.18))
+        self.click(*auto_close)
         self.sleep_interruptible(0.3)
         return True
 

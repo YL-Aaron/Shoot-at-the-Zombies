@@ -1,10 +1,11 @@
 {
+  "mode": 3,
   "priority_skills": [
     "温压弹",
     "矩阵",
     "子弹",
     "干冰弹",
-    "冰雹"
+    "龙卷风"
   ],
   "group_wait_timeout": 30,
   "exit_deep_abyss": true,

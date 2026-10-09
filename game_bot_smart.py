@@ -587,12 +587,20 @@ class GameBot:
             return True
         return False
 
-    def find_click_continue(self):
-        """判断能否发现继续按钮"""
-        continue_button = self.find_template("click-continue.png")
+    def find_click_continue(self, screenshot=None):
+        """处理“点击屏幕继续”，包括招募后弹出的等级提升页。"""
+        continue_button = self.find_template(
+            "click-continue.png",
+            threshold=0.70,
+            use_gray=True,
+            screenshot=screenshot,
+        )
         if continue_button:
-            self.click(*continue_button)
-            self.sleep_interruptible(0.2)
+            self.click_fast(*continue_button)
+            print('检测到“点击屏幕继续”，已关闭等级提升页')
+            self.sleep_interruptible(0.5)
+            return True
+        return False
 
     def find_team_up(self, screenshot=None):
         """判断能否发现队伍页面"""
@@ -616,6 +624,8 @@ class GameBot:
                 if xy:
                     self.click(*xy)
                     self.sleep_interruptible(0.2)
+                    if self.find_click_continue():
+                        continue
                 else:
                     break
             self.find_reconnection()
@@ -626,6 +636,8 @@ class GameBot:
                     recruitment_frame = self.take_screenshot()
                     if recruitment_frame is None:
                         break
+                    if self.find_click_continue(screenshot=recruitment_frame):
+                        continue
                     frame_height, frame_width = recruitment_frame.shape[:2]
                     recruitment_roi = (
                         int(frame_width * 0.32),
@@ -1007,12 +1019,42 @@ class GameBot:
         self.sleep_interruptible(0.3)
         return True
 
+    def _return_to_home_for_invite_mode(self, frame):
+        """邀请模式只在主页等待；其他可返回页面立即退出。"""
+        for template_name, threshold, use_gray in [
+            ('return-1.png', 0.72, False),
+            ('return.png', 0.80, True),
+            ('return-2.png', 0.80, True),
+        ]:
+            return_button = self.find_template(
+                template_name,
+                threshold=threshold,
+                use_gray=use_gray,
+                screenshot=frame,
+            )
+            if not return_button:
+                continue
+            print('组队邀请模式：检测到非主页界面，正在返回主页')
+            self.click_fast(*return_button)
+            self.sleep_interruptible(0.2)
+            self.find_click_continue()
+            self.expecting_huanqiu_battle = False
+            self.group_wait_started_at = None
+            self.invite_retry_not_before = 0
+            return True
+        return False
+
     def handle_dungeon_invite_mode(self):
-        """检查右下角副本邀请，并接受难度最高的寰球救援。"""
-        if self.mode != 3 or time.time() < self.invite_retry_not_before:
+        """在主页检查副本邀请，并接受难度最高的寰球救援。"""
+        if self.mode != 3:
             return False
         frame = self.take_screenshot()
         if frame is None:
+            return False
+        # 返回主页优先于邀请扫描，并且不受邀请冷却限制。
+        if self._return_to_home_for_invite_mode(frame):
+            return True
+        if time.time() < self.invite_retry_not_before:
             return False
         if self._accept_best_huanqiu_invite(frame):
             return True
@@ -1231,10 +1273,10 @@ class GameBot:
         '''Handle a skill page before making any battle-type decision.'''
         if not self.find_skill():
             return False
-        if self.mode == 0 and self.expecting_huanqiu_battle:
-            print('已处理技能选择页，继续寰球远征战斗')
-        else:
+        if self.mode == 0 and self.exit_normal_stage_on_huanqiu:
             print('已处理技能选择页，等待继续判断战斗类型')
+        else:
+            print('已处理技能选择页，继续战斗')
         self.battle_identify_not_before = time.time() + 2
         self.sleep_interruptible(0.5)
         return True
@@ -1492,14 +1534,17 @@ class GameBot:
         return 'unknown', detail
 
     def dismiss_activated_skill_page(self):
-        '''识别“已激活技能”页，并点击弹窗上方空白处关闭。'''
+        '''识别“已激活技能”页，点击底部“自动关闭”区域。'''
         if not self.game_window:
             return False
-        auto_close = self.find_template('auto-close.png', threshold=0.75)
+        _, _, width, height = self.game_window
+        auto_close_roi = (0, int(height * 0.85), width, int(height * 0.14))
+        auto_close = self.find_template(
+            'auto-close.png', threshold=0.70, roi=auto_close_roi
+        )
         if not auto_close:
             return False
-        left, top, width, height = self.game_window
-        self.click(left + width // 2, top + int(height * 0.18))
+        self.click(*auto_close)
         self.sleep_interruptible(0.3)
         return True
 
@@ -1571,18 +1616,58 @@ class GameBot:
 
     def find_stop(self):
         """判断能否发现停止按钮"""
-        stop = self.find_template("battling.png")
+        if not self.game_window:
+            return False
+        left, top, width, height = self.game_window
+        frame = self.take_screenshot()
+        stop = self.find_template(
+            "battling.png",
+            threshold=0.65,
+            use_gray=False,
+            roi=(0, 0, int(width * 0.24), int(height * 0.18)),
+            screenshot=frame,
+        )
         if stop:
-            self.click(*stop)
-            self.sleep_interruptible(0.2)
+            self.click_fast(*stop)
+            print('已点击左上角暂停按钮')
+        else:
+            # 战斗界面已被明确确认时，比例坐标作为模板失配的保底。
+            self.click_fast(
+                left + int(width * 0.085),
+                top + int(height * 0.078),
+            )
+            print('暂停按钮模板未匹配，已使用左上角比例坐标')
+        self.sleep_interruptible(0.5)
+        return True
 
-    def find_exit(self):
+    def find_exit(self, attempts=8):
         """判断能否发现退出按钮"""
-        exit_button = self.find_template("exit.png")
-        if exit_button:
-            self.click(*exit_button)
-            self.sleep_interruptible(0.2)
-            return True
+        if not self.game_window:
+            return False
+        _, _, width, height = self.game_window
+        exit_roi = (
+            int(width * 0.08),
+            int(height * 0.15),
+            int(width * 0.84),
+            int(height * 0.75),
+        )
+        for attempt in range(attempts):
+            frame = self.take_screenshot()
+            exit_button = self.find_template(
+                "exit.png",
+                threshold=0.68,
+                use_gray=False,
+                roi=exit_roi,
+                screenshot=frame,
+            )
+            if exit_button:
+                self.click_fast(*exit_button)
+                self.sleep_interruptible(0.5)
+                print('已点击退出战斗按钮')
+                return True
+            if attempt < attempts - 1:
+                self.sleep_interruptible(0.2)
+        print('暂停菜单中未找到退出按钮，稍后将重试')
         return False
 
     def find_card(self):
@@ -1644,6 +1729,9 @@ class GameBot:
             if not self.game_window and not self.find_game_window():
                 self.sleep_interruptible(5)
                 continue
+            # 招募按钮可能触发等级提升，必须先点击继续才能后续操作。
+            if self.find_click_continue():
+                continue
             # 副本邀请弹窗要在通用关闭逻辑之前处理。
             if self.handle_dungeon_invite_mode():
                 continue
@@ -1663,6 +1751,7 @@ class GameBot:
             batileTime = None
             battle_seen = False
             huanqiu_identify_failures = 0
+            battle_type_verified = False
             # 是不是在战斗中
             while True and self.running:
 
@@ -1713,10 +1802,7 @@ class GameBot:
                 should_identify_huanqiu = (
                     self.mode == 0
                     and self.exit_normal_stage_on_huanqiu
-                    and (
-                        self.exit_normal_stage
-                        or not self.expecting_huanqiu_battle
-                    )
+                    and not battle_type_verified
                 )
                 if should_identify_huanqiu:
                     battle_type, detail = self.classify_battle_type()
@@ -1727,6 +1813,7 @@ class GameBot:
                         )
                         self.exit_normal_stage = False
                         self.expecting_huanqiu_battle = True
+                        battle_type_verified = True
                     elif self.handle_battle_skill_page():
                         huanqiu_identify_failures = 0
                         print('判断寰球期间出现技能选择页，已处理后重新判断')
@@ -1749,12 +1836,8 @@ class GameBot:
                         continue
 
                 if (
-                    self.mode == 0
-                    and self.exit_normal_stage_on_huanqiu
-                    and (
-                        self.exit_normal_stage
-                        or not self.expecting_huanqiu_battle
-                    )
+                    should_identify_huanqiu
+                    and battle_type == 'normal'
                 ):
                     print('打寰球过程中检测到误入普通关卡，正在退出战斗')
                     self.find_stop()
