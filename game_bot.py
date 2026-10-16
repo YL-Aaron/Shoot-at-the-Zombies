@@ -41,6 +41,8 @@ SKILL_LIST = [
     {"name": "风刃", "template": ["skill-fr.png", "skill-fr-1.png"]},
     {"name": "激光", "template": ["skill-jg.png", "skill-jg-1.png"]},
     {"name": "龙卷风", "template": ["skill-ljf.png", "skill-ljf-1.png"]},
+    {"name": "时空裂缝", "template": ["skill-sklf.png"]},
+    {"name": "迷雾之触", "template": ["skill-mwzc.png"]},
     {"name": "燃油", "template": ["skill-ry.png", "skill-ry-1.png"]},
     {"name": "射线", "template": ["skill-sx.png", "skill-sx-1.png"]},
     {"name": "无人机", "template": ["skill-wrj.png", "skill-wrj-1.png"]},

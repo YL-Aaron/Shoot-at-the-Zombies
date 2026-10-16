@@ -60,6 +60,8 @@ SKILL_LIST = [
     {"name": "风刃", "template": ["skill-fr.png", "skill-fr-1.png"]},
     {"name": "激光", "template": ["skill-jg.png", "skill-jg-1.png"]},
     {"name": "龙卷风", "template": ["skill-ljf.png", "skill-ljf-1.png"]},
+    {"name": "时空裂缝", "template": ["skill-sklf.png"]},
+    {"name": "迷雾之触", "template": ["skill-mwzc.png"]},
     {"name": "燃油", "template": ["skill-ry.png", "skill-ry-1.png"]},
     {"name": "射线", "template": ["skill-sx.png", "skill-sx-1.png"]},
     {"name": "无人机", "template": ["skill-wrj.png", "skill-wrj-1.png"]},
@@ -1015,12 +1017,31 @@ class GameBot:
         print(f'选择寰球救援邀请，难度 {difficulty_text}')
         self.click_fast(*accept)
         self.expecting_huanqiu_battle = True
-        self.invite_retry_not_before = time.time() + 1
+        # 给接受后的转场留出保护时间，避免队伍标题未渲染时误点退出。
+        self.invite_retry_not_before = time.time() + 3
         self.sleep_interruptible(0.3)
         return True
 
     def _return_to_home_for_invite_mode(self, frame):
-        """邀请模式只在主页等待；其他可返回页面立即退出。"""
+        """邀请模式在主页等待，但已进入的寰球队伍必须保留。"""
+        if (
+            self.expecting_huanqiu_battle
+            and time.time() < self.invite_retry_not_before
+        ):
+            return False
+        # 寰球队伍页也有 return-1.png 样式的退出按钮。如果先匹配
+        # 返回按钮，刚接受的邀请会被立即退出。
+        in_huanqiu_team = self.find_in_huanqiu_team(
+            screenshot=frame,
+            attempts=1,
+        )
+        team_up = self.find_team_up(screenshot=frame)
+        if self.expecting_huanqiu_battle and (
+            in_huanqiu_team or team_up
+        ):
+            self.expecting_huanqiu_battle = True
+            return False
+
         for template_name, threshold, use_gray in [
             ('return-1.png', 0.72, False),
             ('return.png', 0.80, True),
@@ -1220,7 +1241,34 @@ class GameBot:
             for second in page_matches[index + 1:]
         )
         if not has_skill_page_layout:
-            return None
+            # 只识别到一个已知技能，或三个技能都没有模板时，
+            # 无法用“两个已知技能横向排列”确认页面。再取一帧
+            # 确认浅色卡片结构，避免在战斗特效中误点。
+            self.sleep_interruptible(0.08)
+            confirmation_frame = self.take_screenshot()
+            if confirmation_frame is None:
+                return None
+            confirmation_skill_frame = confirmation_frame[
+                roi_y:roi_y + roi_height,
+                0:window_width,
+            ]
+            confirmation_hsv = cv2.cvtColor(
+                confirmation_skill_frame,
+                cv2.COLOR_BGR2HSV,
+            )
+            confirmation_mask = (
+                (confirmation_hsv[:, :, 2] >= 160)
+                & (confirmation_hsv[:, :, 1] <= 95)
+            )
+            confirmation_ratios = [
+                np.mean(part)
+                for part in np.array_split(confirmation_mask, 3, axis=1)
+            ]
+            if (
+                np.mean(confirmation_mask) < 0.30
+                or sum(ratio >= 0.25 for ratio in confirmation_ratios) < 2
+            ):
+                return None
 
         def is_best_local_label(match):
             score, x, y = match
@@ -1267,13 +1315,31 @@ class GameBot:
             )
             self.sleep_interruptible(0.2)
             return True
+
+        # 页面结构已经连续两帧确认，但所有技能都没有可用
+        # 模板。选择最左侧的可见卡片作为保底，防止选择页卡住。
+        visible_columns = [
+            index for index, ratio in enumerate(third_ratios)
+            if ratio >= 0.25
+        ]
+        if visible_columns:
+            column = visible_columns[0]
+            fallback_x = int(window_width * (column + 0.5) / 3)
+            fallback_y = roi_y + roi_height // 2
+            print('未识别到设定范围内的技能，选择第一个可见技能继续')
+            self.click_fast(
+                self.game_window[0] + fallback_x,
+                self.game_window[1] + fallback_y,
+            )
+            self.sleep_interruptible(0.2)
+            return True
         return None
 
     def handle_battle_skill_page(self):
         '''Handle a skill page before making any battle-type decision.'''
         if not self.find_skill():
             return False
-        if self.mode == 0 and self.exit_normal_stage_on_huanqiu:
+        if self.mode in (0, 3) and self.exit_normal_stage_on_huanqiu:
             print('已处理技能选择页，等待继续判断战斗类型')
         else:
             print('已处理技能选择页，继续战斗')
@@ -1800,7 +1866,7 @@ class GameBot:
                     continue
 
                 should_identify_huanqiu = (
-                    self.mode == 0
+                    self.mode in (0, 3)
                     and self.exit_normal_stage_on_huanqiu
                     and not battle_type_verified
                 )
@@ -1873,6 +1939,12 @@ class GameBot:
                 print("战斗时间:", time.time() - batileTime)
             # 副本邀请模式只等待邀请，不能点击普通关卡的开始按钮。
             if self.mode == 3:
+                if battle_seen:
+                    # 战斗结束后不再保护寰球队伍页；下一轮由
+                    # _return_to_home_for_invite_mode() 退回主页继续等待邀请。
+                    self.expecting_huanqiu_battle = False
+                    self.group_wait_started_at = None
+                    self.invite_retry_not_before = 0
                 self.sleep_interruptible(0.15)
                 continue
 
