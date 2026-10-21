@@ -608,6 +608,67 @@ class GameBot:
         """判断能否发现队伍页面"""
         return self.find_template("team-up.png", screenshot=screenshot)
 
+    def find_huanqiu_recruitment_cards(self, frame, roi):
+        """只匹配四字标题的笔画，并逐字核验，避免橙色卡底造成误匹配。"""
+        roi_x, roi_y, roi_width, roi_height = roi
+        patch = frame[roi_y:roi_y + roi_height, roi_x:roi_x + roi_width]
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        text_mask = ((hsv[:, :, 2] >= 175) & (hsv[:, :, 1] <= 105)).astype(np.uint8) * 255
+        if not hasattr(self, '_template_cache'):
+            self._template_cache = {}
+        positions = []
+        for name, bounds in [
+            ('huanqiu.png', (8, 6, 76, 23)),
+            ('huanqiu1.png', (0, 0, 64, 17)),
+            ('huanqiu2.png', (16, 7, 88, 25)),
+        ]:
+            for scale in self._template_scale_candidates():
+                key = ('recruitment-title-strokes', name, scale)
+                if key not in self._template_cache:
+                    original = cv2.imread(os.path.join(self.template_dir, name))
+                    if original is None:
+                        continue
+                    x1, y1, x2, y2 = bounds
+                    title = original[y1:y2, x1:x2]
+                    if abs(scale - 1.0) > 0.001:
+                        title = cv2.resize(title, None, fx=scale, fy=scale)
+                    title_hsv = cv2.cvtColor(title, cv2.COLOR_BGR2HSV)
+                    self._template_cache[key] = (
+                        (title_hsv[:, :, 2] >= 175)
+                        & (title_hsv[:, :, 1] <= 105)
+                    ).astype(np.uint8) * 255
+                template = self._template_cache[key]
+                height, width = template.shape
+                if height > text_mask.shape[0] or width > text_mask.shape[1]:
+                    continue
+                scores = cv2.matchTemplate(text_mask, template, cv2.TM_CCOEFF_NORMED)
+                for _ in range(8):
+                    _, score, _, (x, y) = cv2.minMaxLoc(scores)
+                    if score < 0.70:
+                        break
+                    candidate = text_mask[y:y + height, x:x + width]
+                    # 每个字都必须相似，不能依靠共有的“-难度”或卡片边框命中。
+                    character_scores = []
+                    for actual, expected in zip(
+                        np.array_split(candidate > 0, 4, axis=1),
+                        np.array_split(template > 0, 4, axis=1),
+                    ):
+                        total = np.count_nonzero(actual) + np.count_nonzero(expected)
+                        character_scores.append(
+                            2 * np.count_nonzero(actual & expected) / max(total, 1)
+                        )
+                    saturation = hsv[y:y + height, x:x + width, 1]
+                    if min(character_scores) >= 0.60 and np.median(saturation) >= 90:
+                        positions.append((
+                            self.game_window[0] + roi_x + x + width // 2,
+                            self.game_window[1] + roi_y + y + height // 2,
+                        ))
+                    scores[
+                        max(0, y - height):y + height + 1,
+                        max(0, x - width):x + width + 1,
+                    ] = -1
+        return positions
+
     def find_recruitment(self):
         while True and self.running:
             """判断能否发现招募页面"""
@@ -647,20 +708,9 @@ class GameBot:
                         int(frame_width * 0.40),
                         int(frame_height * 0.53),
                     )
-                    huanqiu_positions = []
-                    for template_name, threshold in [
-                        ("huanqiu-unique-2.png", 0.80),
-                        ("huanqiu-unique.png", 0.80),
-                        ("huanqiu-unique-1.png", 0.80),
-                    ]:
-                        huanqiu_positions.extend(self.find_all_templates(
-                            template_name,
-                            threshold=threshold,
-                            min_color_saturation=45,
-                            min_template_saturation_ratio=0.78,
-                            screenshot=recruitment_frame,
-                            roi=recruitment_roi,
-                        ))
+                    huanqiu_positions = self.find_huanqiu_recruitment_cards(
+                        recruitment_frame, recruitment_roi,
+                    )
 
                     deduped_positions = []
                     for pos in sorted(huanqiu_positions, key=lambda p: p[1], reverse=True):
@@ -674,14 +724,10 @@ class GameBot:
                         if not self.click_fast(join_x, y):
                             self.sleep_interruptible(0.5)
                             return False
-                        # 点击后给页面足够时间进队，避免在卡片消失前
-                        # 每 0.05 秒重复点击同一位置。
-                        for _ in range(6):
-                            self.sleep_interruptible(0.12)
-                            if self.find_team_up():
-                                # 入队后立即辨别并退出普通关卡，不等下一次主循环。
-                                self.exit_normal_team_before_battle()
-                                return True
+                        self.sleep_interruptible(0.03)
+                        if self.find_team_up():
+                            self.exit_normal_team_before_battle()
+                            return True
                     else:
                         self.sleep_interruptible(0.03)  # 减少等待时间
                 except Exception as e:
