@@ -1,6 +1,7 @@
 - 向僵尸开炮
   - 自动刷环球、关卡
-  - 执行命令python game_bot.py
+  - 仅保留智能版，双击 start.bat 或执行 python game_bot_smart.py
+  - 打包执行 build_game_bot_smart.bat，生成 dist/start_game_smart.exe
     - --battle_count:执行次数,默认0表示无限循环
     - --mode:模式 0:自动刷环球(进别人队伍) 1:刷卡关 3:接受副本邀请中难度最高的寰球救援
   - 仅支持Windows PC端微信小程序

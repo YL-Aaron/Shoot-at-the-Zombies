@@ -649,9 +649,9 @@ class GameBot:
                     )
                     huanqiu_positions = []
                     for template_name, threshold in [
-                        ("huanqiu2.png", 0.7),
-                        ("huanqiu.png", 0.75),
-                        ("huanqiu1.png", 0.75),
+                        ("huanqiu-unique-2.png", 0.80),
+                        ("huanqiu-unique.png", 0.80),
+                        ("huanqiu-unique-1.png", 0.80),
                     ]:
                         huanqiu_positions.extend(self.find_all_templates(
                             template_name,
@@ -674,11 +674,14 @@ class GameBot:
                         if not self.click_fast(join_x, y):
                             self.sleep_interruptible(0.5)
                             return False
-                        self.sleep_interruptible(0.05)
-                        if self.find_team_up():
-                            # 入队后立即辨别并退出普通关卡，不等下一次主循环。
-                            self.exit_normal_team_before_battle()
-                            return True
+                        # 点击后给页面足够时间进队，避免在卡片消失前
+                        # 每 0.05 秒重复点击同一位置。
+                        for _ in range(6):
+                            self.sleep_interruptible(0.12)
+                            if self.find_team_up():
+                                # 入队后立即辨别并退出普通关卡，不等下一次主循环。
+                                self.exit_normal_team_before_battle()
+                                return True
                     else:
                         self.sleep_interruptible(0.03)  # 减少等待时间
                 except Exception as e:
@@ -2377,7 +2380,7 @@ if __name__ == "__main__":
 # 1. 安装必要的依赖: pip install pyautogui opencv-python pillow pynput pywin32
 # 2. 替换脚本中的游戏窗口标题为你的游戏窗口标题
 # 3. 在 templates 文件夹中添加游戏界面元素的截图作为模板
-# 4. 运行脚本: python game_bot.py
+# 4. 运行脚本: python game_bot_smart.py
 # 5. 脚本会自动查找游戏窗口，开始战斗，收集奖励
 #
 # 注意事项:
