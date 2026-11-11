@@ -1,14 +1,21 @@
 {
-  "mode": 3,
-  "priority_skills": [
-    "温压弹",
-    "矩阵",
-    "子弹",
-    "干冰弹",
-    "龙卷风"
-  ],
-  "group_wait_timeout": 30,
-  "exit_deep_abyss": true,
-  "exit_normal_stage_on_huanqiu": true,
-  "prioritize_biochemical_bullet": true
+  "base": {
+    "game_title": "向僵尸开炮",
+    "mode": 0,
+    "huanqiu_entry": "invite",
+    "group_wait_timeout": 30
+  },
+  "battle": {
+    "battle_count": 0,
+    "battle_time": 0,
+    "priority_skills": [
+      "温压弹",
+      "矩阵",
+      "子弹",
+      "干冰弹",
+      "龙卷风"
+    ],
+    "exit_on_mode_mismatch": true,
+    "prioritize_biochemical_bullet": true
+  }
 }

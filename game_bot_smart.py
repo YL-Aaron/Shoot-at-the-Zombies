@@ -17,6 +17,7 @@ from pynput import keyboard
 import win32api
 import win32con
 from win32 import win32gui
+from bot_config import BaseConfig, BattleConfig, dump_settings, load_settings
 
 
 def enable_dpi_awareness():
@@ -76,14 +77,18 @@ next(
 
 
 class GameBot:
-    def __init__(self, game_title="游戏窗口标题", battle_time=0, battle_count=0, mode=0, priority_skills=None):
+    def __init__(self, base_config=None, battle_config=None):
+        self.base_config = base_config if base_config is not None else BaseConfig()
+        self.battle_config = battle_config if battle_config is not None else BattleConfig()
+        self.priority_skill_templates = [
+            skill['template']
+            for name in self.battle_config.priority_skills
+            for skill in SKILL_LIST if skill['name'] == name
+        ]
         self.running = True
-        self.group_wait_timeout = 30
         self.group_wait_started_at = None
-        self.exit_deep_abyss = False
         self.exit_normal_stage = False
-        self.exit_normal_stage_on_huanqiu = True
-        self.prioritize_biochemical_bullet = True
+        self.mode_exit_pending = False
         self.expecting_huanqiu_battle = False
         self.initial_skill_check_deadline = None
         self.battle_identify_not_before = None
@@ -91,24 +96,30 @@ class GameBot:
         self.hotkey_listener = None
         self.sct = mss.mss()
         """初始化游戏机器人"""
-        self.game_title = game_title
-        self.battle_time = battle_time
-        self.battle_count = battle_count
         self.game_window = None
         self.screenshot_dir = "screenshots"
-        self.priority_skills = priority_skills if priority_skills else []
 
         # 单文件打包时，PyInstaller 会将内置模板解压到临时资源目录。
         self.template_dir = resource_path("templates")
 
-        self.mode = mode
-
         # 创建必要的目录
         os.makedirs(self.screenshot_dir, exist_ok=True)
 
+    @property
+    def is_huanqiu_mode(self):
+        return self.base_config.mode == 0
+
+    @property
+    def is_invite_mode(self):
+        return self.is_huanqiu_mode and self.base_config.huanqiu_entry == 'invite'
+
+    @property
+    def is_channel_mode(self):
+        return self.is_huanqiu_mode and self.base_config.huanqiu_entry == 'channel'
+
     def find_game_window(self):
         """查找并激活游戏窗口"""
-        hwnd = win32gui.FindWindow(None, self.game_title)
+        hwnd = win32gui.FindWindow(None, self.base_config.game_title)
         if hwnd:
             win32gui.SetForegroundWindow(hwnd)
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
@@ -1116,7 +1127,7 @@ class GameBot:
 
     def handle_dungeon_invite_mode(self):
         """在主页检查副本邀请，并接受难度最高的寰球救援。"""
-        if self.mode != 3:
+        if not self.is_invite_mode:
             return False
         frame = self.take_screenshot()
         if frame is None:
@@ -1184,7 +1195,7 @@ class GameBot:
             )
 
         # 首先检查4个优先技能
-        for priority_skill_templates in self.priority_skills:
+        for priority_skill_templates in self.priority_skill_templates:
             if priority_skill_templates:
                 # priority_skill_templates 是模板文件名列表
                 for template in priority_skill_templates:
@@ -1243,7 +1254,7 @@ class GameBot:
         if np.mean(card_mask) < 0.30 or sum(ratio >= 0.25 for ratio in third_ratios) < 2:
             return None
 
-        if self.prioritize_biochemical_bullet:
+        if self.battle_config.prioritize_biochemical_bullet:
             biochemical_roi = (
                 0,
                 int(window_height * 0.35),
@@ -1330,7 +1341,7 @@ class GameBot:
             return score >= max(nearby_scores, default=score) - 0.01
 
         # 当前优先级的所有形态一起比较，避免先匹配到相似但错误的图标。
-        for template_names in self.priority_skills:
+        for template_names in self.priority_skill_templates:
             match = best_match(template_names)
             if match and is_best_local_label(match):
                 skill_name = next(
@@ -1388,7 +1399,7 @@ class GameBot:
         '''Handle a skill page before making any battle-type decision.'''
         if not self.find_skill():
             return False
-        if self.mode in (0, 3) and self.exit_normal_stage_on_huanqiu:
+        if self.battle_config.exit_on_mode_mismatch:
             print('已处理技能选择页，等待继续判断战斗类型')
         else:
             print('已处理技能选择页，继续战斗')
@@ -1611,42 +1622,31 @@ class GameBot:
                 return True
         return False
     def classify_battle_type(self):
-        '''融合入口状态和标题视觉证据，返回关卡类型及判断详情。'''
-        visual_huanqiu = self.find_huanqiu_battle()
-        visual_normal = (
-            False if visual_huanqiu else self.find_normal_battle_title()
-        )
-        self.last_normal_title_format = visual_normal
-        visual_score = getattr(self, 'last_huanqiu_battle_score', 0.0)
-        huanqiu_score = 0
-        normal_score = 0
-        reasons = []
+        '''用实际标题判断模式；没识别到标题不等于识别到其他模式。'''
+        if self.find_deep_abyss():
+            return 'deep_abyss', '深渊同行：第X层'
+        if self.find_huanqiu_battle():
+            return 'huanqiu', '寰球救援标题'
+        if self.find_normal_battle_title():
+            return 'normal', '关卡标题：数字.文字'
+        return 'unknown', '标题尚未明确，继续识别'
 
-        if visual_huanqiu:
-            huanqiu_score += 5
-            reasons.append(f'寰球标题={visual_score:.2f}')
-        elif visual_normal:
-            normal_score += 5
-            reasons.append('普通标题=数字.文字')
-        elif visual_score <= 0.55:
-            normal_score += 3
-            reasons.append(f'未见寰球标题={visual_score:.2f}')
-        else:
-            reasons.append(f'寰球标题弱匹配={visual_score:.2f}')
+    def battle_matches_selected_mode(self, battle_type):
+        if battle_type == 'unknown':
+            return None
+        expected = 'huanqiu' if self.is_huanqiu_mode else 'normal'
+        return battle_type == expected
 
-        if self.expecting_huanqiu_battle:
-            huanqiu_score += 2
-            reasons.append('入口状态=寰球队伍')
-        if self.exit_normal_stage:
-            normal_score += 3
-            reasons.append('入口状态=普通关卡')
-
-        detail = f'寰球{huanqiu_score}:普通{normal_score}；' + '，'.join(reasons)
-        if huanqiu_score >= 5 and huanqiu_score - normal_score >= 2:
-            return 'huanqiu', detail
-        if normal_score >= 3 and normal_score - huanqiu_score >= 2:
-            return 'normal', detail
-        return 'unknown', detail
+    def exit_mismatched_battle(self):
+        """退出未成功时保留状态，下一轮继续退出，避免重新选技能。"""
+        if not self.find_exit(attempts=1):
+            self.find_stop()
+            if not self.find_exit():
+                return False
+        self.mode_exit_pending = False
+        self.exit_normal_stage = False
+        self.expecting_huanqiu_battle = False
+        return True
 
     def dismiss_activated_skill_page(self):
         '''识别“已激活技能”页，点击底部“自动关闭”区域。'''
@@ -1697,7 +1697,7 @@ class GameBot:
 
     def exit_normal_team_before_battle(self):
         """用同一帧快速识别普通队伍，优先于战斗检测退出。"""
-        if self.mode != 0 or not self.exit_normal_stage_on_huanqiu:
+        if not self.is_channel_mode or not self.battle_config.exit_on_mode_mismatch:
             return False
         frame = self.take_screenshot()
         if frame is None or not self.find_team_up(screenshot=frame):
@@ -1830,7 +1830,7 @@ class GameBot:
 
         print("开始自动刷图脚本...")
         print("提示: 按下ESC键可以随时停止脚本")
-        count = self.battle_count
+        count = self.battle_config.battle_count
 
         # timestamp = time.time()
         while self.running:
@@ -1865,16 +1865,14 @@ class GameBot:
 
             batileTime = None
             battle_seen = False
-            huanqiu_identify_failures = 0
             battle_type_verified = False
             # 是不是在战斗中
             while True and self.running:
 
-                if self.mode == 2:
-                    self.find_fullscreen_window()
-                    # 检查开始游戏是否可点击
-                    self.find_orange_start_game()
-                    self.sleep_interruptible(10)
+                if self.mode_exit_pending:
+                    if self.exit_mismatched_battle():
+                        break
+                    self.sleep_interruptible(0.2)
                     continue
 
                 # 队长可能随时开始。先用一张截图检查并退出普通关卡队伍，
@@ -1905,7 +1903,6 @@ class GameBot:
 
                 # Skill pages can also appear after the initial 15 seconds.
                 if self.handle_battle_skill_page():
-                    huanqiu_identify_failures = 0
                     continue
                 if (
                     self.battle_identify_not_before is not None
@@ -1914,57 +1911,32 @@ class GameBot:
                     self.sleep_interruptible(0.2)
                     continue
 
-                should_identify_huanqiu = (
-                    self.mode in (0, 3)
-                    and self.exit_normal_stage_on_huanqiu
+                should_identify_mode = (
+                    self.battle_config.exit_on_mode_mismatch
                     and not battle_type_verified
                 )
-                if should_identify_huanqiu:
+                if should_identify_mode:
                     battle_type, detail = self.classify_battle_type()
-                    if battle_type == 'huanqiu':
-                        huanqiu_identify_failures = 0
-                        print(
-                            f'融合判断为寰球远征（{detail}），取消普通关卡退出'
-                        )
+                    matches = self.battle_matches_selected_mode(battle_type)
+                    if matches is True:
+                        print(f'战斗模式符合所选模式（{detail}），继续战斗')
                         self.exit_normal_stage = False
-                        self.expecting_huanqiu_battle = True
+                        self.expecting_huanqiu_battle = self.is_huanqiu_mode
                         battle_type_verified = True
                     elif self.handle_battle_skill_page():
-                        huanqiu_identify_failures = 0
-                        print('判断寰球期间出现技能选择页，已处理后重新判断')
+                        print('判断模式期间出现技能选择页，处理后重新判断')
                         continue
-                    elif battle_type == 'normal':
-                        huanqiu_identify_failures += 1
-                        required_confirmations = (
-                            1 if self.last_normal_title_format
-                            else 3 if self.exit_normal_stage
-                            else 5
-                        )
-                        if huanqiu_identify_failures < required_confirmations:
-                            print(f'普通关卡候选，等待连续确认（{detail}）')
-                            self.sleep_interruptible(0.3)
-                            continue
+                    elif matches is False:
+                        selected = '寰球救援' if self.is_huanqiu_mode else '关卡模式'
+                        print(f'模式误入退出：选择了{selected}，检测到{detail}，正在退出')
+                        self.mode_exit_pending = True
+                        if self.exit_mismatched_battle():
+                            break
+                        continue
                     else:
-                        huanqiu_identify_failures = 0
-                        print(f'战斗类型证据不足，保持未知并继续观察（{detail}）')
+                        print(f'战斗模式尚未明确（{detail}）')
                         self.sleep_interruptible(0.2)
                         continue
-
-                if (
-                    should_identify_huanqiu
-                    and battle_type == 'normal'
-                ):
-                    print('打寰球过程中检测到误入普通关卡，正在退出战斗')
-                    self.find_stop()
-                    if self.find_exit():
-                        self.exit_normal_stage = False
-                        self.expecting_huanqiu_battle = False
-                    break
-                if self.exit_deep_abyss and self.find_deep_abyss():
-                    print('检测到深渊同行，正在退出战斗')
-                    self.find_stop()
-                    self.find_exit()
-                    break
                 print("正在战斗中")
                 # 点击技能
                 self.find_skill()
@@ -1981,13 +1953,16 @@ class GameBot:
                 if batileTime is None:
                     batileTime = time.time()
                 else:
-                    if self.battle_time > 0 and time.time() - batileTime > self.battle_time:
-                        print(f"战斗时间超过{self.battle_time}秒,退出")
+                    if self.battle_config.battle_time > 0 and time.time() - batileTime > self.battle_config.battle_time:
+                        print(f"战斗时间超过{self.battle_config.battle_time}秒,退出")
                         self.find_stop()
                         self.find_exit()
                 print("战斗时间:", time.time() - batileTime)
+            if not self.running:
+                break
+
             # 副本邀请模式只等待邀请，不能点击普通关卡的开始按钮。
-            if self.mode == 3:
+            if self.is_invite_mode:
                 if battle_seen:
                     # 战斗结束后不再保护寰球队伍页；下一轮由
                     # _return_to_home_for_invite_mode() 退回主页继续等待邀请。
@@ -1998,10 +1973,9 @@ class GameBot:
                 continue
 
             # 是否刷环球
-            if self.mode == 0:
+            if self.is_channel_mode:
                 battling = self.find_battling()
                 if battling:
-                    self.running = True
                     continue
                 # 先判断当前队伍类型，再决定是否进入招募，避免普通组队页
                 # 上的招募入口绕过退出队伍流程。
@@ -2020,7 +1994,7 @@ class GameBot:
                     self.battle_identify_not_before = None
 
                 if (
-                    self.exit_normal_stage_on_huanqiu
+                    self.battle_config.exit_on_mode_mismatch
                     and normal_stage_team
                     and not in_huanqiu_team
                 ):
@@ -2075,17 +2049,17 @@ class GameBot:
             if not start_button:
                 # 抢到寰球救援后，组队界面可能还在等待队长开始。此时
                 # return-1.png 是“退出队伍”，不能当成普通返回按钮点击。
-                if self.mode == 0 and (
+                if self.is_channel_mode and (
                     in_huanqiu_team or team_up
                 ):
                     if self.group_wait_started_at is None:
                         self.group_wait_started_at = time.time()
                     wait_seconds = time.time() - self.group_wait_started_at
                     if (
-                        self.group_wait_timeout > 0
-                        and wait_seconds >= self.group_wait_timeout
+                        self.base_config.group_wait_timeout > 0
+                        and wait_seconds >= self.base_config.group_wait_timeout
                     ):
-                        print(f'组队等待超过{self.group_wait_timeout}秒，退出后重新招募')
+                        print(f'组队等待超过{self.base_config.group_wait_timeout}秒，退出后重新招募')
                         self.group_wait_started_at = None
                         self.expecting_huanqiu_battle = False
                         self.find_dont_battle_return()
@@ -2093,7 +2067,7 @@ class GameBot:
                         continue
                     print(
                         f'已进入寰球救援队伍，等待开始：'
-                        f'{int(wait_seconds)}/{self.group_wait_timeout}秒'
+                        f'{int(wait_seconds)}/{self.base_config.group_wait_timeout}秒'
                     )
                     self.sleep_interruptible(2)
                     continue
@@ -2104,11 +2078,11 @@ class GameBot:
                 continue
             self.group_wait_started_at = None
             # 是否刷环球
-            if self.mode == 0:
+            if self.is_channel_mode:
                 # 检查当前页面是否在环球页面
                 self.find_im()
             # 是否刷卡关
-            if self.mode == 1:
+            if self.base_config.mode == 1:
                 # 检查当前页面是否在卡关页面
                 self.find_card()
             # 点击继续
@@ -2138,13 +2112,6 @@ class GameBotGUI:
         # 加载保存的配置
         self.load_config()
 
-    def get_skill_template_by_name(self, name):
-        """根据技能名称获取模板文件名列表"""
-        for skill in SKILL_LIST:
-            if skill["name"] == name:
-                return skill["template"]
-        return None
-
     def load_config(self):
         """加载保存的配置"""
         try:
@@ -2154,87 +2121,103 @@ class GameBotGUI:
                 load_path = resource_path("config.json")
             if os.path.exists(load_path):
                 with open(load_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    self.mode_var.set(config.get('mode', 0))
-                    self.group_wait_timeout_var.set(
-                        config.get('group_wait_timeout', 30)
-                    )
-                    self.exit_deep_abyss_var.set(
-                        config.get('exit_deep_abyss', False)
-                    )
-                    self.exit_normal_stage_var.set(
-                        config.get('exit_normal_stage_on_huanqiu', True)
-                    )
-                    self.prioritize_biochemical_bullet_var.set(
-                        config.get('prioritize_biochemical_bullet', True)
-                    )
+                    base, battle = load_settings(json.load(f))
+                    self.game_title_var.set(base.game_title)
+                    self.mode_var.set(base.mode)
+                    self.huanqiu_entry_var.set(base.huanqiu_entry)
+                    self.battle_count_var.set(battle.battle_count)
+                    self.battle_time_var.set(battle.battle_time)
+                    self.group_wait_timeout_var.set(base.group_wait_timeout)
+                    self.exit_on_mode_mismatch_var.set(battle.exit_on_mode_mismatch)
+                    self.prioritize_biochemical_bullet_var.set(battle.prioritize_biochemical_bullet)
                     # 加载优先技能配置
-                    priority_skills = config.get('priority_skills', [])
-                    for i, skill_name in enumerate(priority_skills):
-                        if i < len(self.priority_skill_vars):
-                            self.priority_skill_vars[i].set(skill_name)
+                    for i, var in enumerate(self.priority_skill_vars):
+                        var.set(battle.priority_skills[i] if i < len(battle.priority_skills) else '')
+                    self.on_skill_selected(None)
         except Exception as e:
             print(f"加载配置失败: {e}")
+
+    def collect_settings(self):
+        """入口和战斗配置分别构建，所有入口共享同一份战斗配置。"""
+        base = BaseConfig(
+            game_title=self.game_title_var.get(),
+            mode=self.mode_var.get(),
+            huanqiu_entry=self.huanqiu_entry_var.get(),
+            group_wait_timeout=max(0, self.group_wait_timeout_var.get()),
+        )
+        battle = BattleConfig(
+            battle_count=max(0, self.battle_count_var.get()),
+            battle_time=max(0, self.battle_time_var.get()),
+            priority_skills=[var.get() for var in self.priority_skill_vars],
+            exit_on_mode_mismatch=self.exit_on_mode_mismatch_var.get(),
+            prioritize_biochemical_bullet=self.prioritize_biochemical_bullet_var.get(),
+        )
+        return base, battle
 
     def save_config(self):
         """保存当前配置"""
         try:
-            config = {
-                'mode': self.mode_var.get(),
-                'priority_skills': [var.get() for var in self.priority_skill_vars],
-                'group_wait_timeout': self.group_wait_timeout_var.get(),
-                'exit_deep_abyss': self.exit_deep_abyss_var.get(),
-                'exit_normal_stage_on_huanqiu': (
-                    self.exit_normal_stage_var.get()
-                ),
-                'prioritize_biochemical_bullet': (
-                    self.prioritize_biochemical_bullet_var.get()
-                ),
-
-            }
+            config = dump_settings(*self.collect_settings())
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存配置失败: {e}")
 
     def create_widgets(self):
+        base_frame = ttk.LabelFrame(self.root, text='基础配置（模式入口）')
+        base_frame.grid(row=0, column=0, padx=10, pady=5, sticky=tk.EW)
+        battle_frame = ttk.LabelFrame(self.root, text='战斗模式配置（所有入口通用）')
+        battle_frame.grid(row=1, column=0, padx=10, pady=5, sticky=tk.EW)
         # 游戏标题
-        ttk.Label(self.root, text="游戏窗口标题:").grid(row=0, column=0, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(base_frame, text="游戏窗口标题:").grid(row=0, column=0, padx=10, pady=5, sticky=tk.W)
         self.game_title_var = tk.StringVar(value="向僵尸开炮")
-        ttk.Entry(self.root, textvariable=self.game_title_var, width=30).grid(row=0, column=1, padx=10, pady=5)
+        ttk.Entry(base_frame, textvariable=self.game_title_var, width=30).grid(row=0, column=1, padx=10, pady=5)
 
         # 模式选择
-        ttk.Label(self.root, text="模式:").grid(row=1, column=0, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(base_frame, text="模式:").grid(row=1, column=0, padx=10, pady=5, sticky=tk.W)
         self.mode_var = tk.IntVar(value=0)
-        mode_frame = ttk.Frame(self.root)
+        mode_frame = ttk.Frame(base_frame)
         mode_frame.grid(row=1, column=1, padx=10, pady=5, sticky=tk.W)
-        ttk.Radiobutton(mode_frame, text="打环球", variable=self.mode_var, value=0).pack(side=tk.LEFT)
-        ttk.Radiobutton(mode_frame, text="刷卡关", variable=self.mode_var, value=1).pack(side=tk.LEFT)
-        ttk.Radiobutton(mode_frame, text="副本邀请", variable=self.mode_var, value=3).pack(side=tk.LEFT)
-        # ttk.Radiobutton(mode_frame, text="全屏模式", variable=self.mode_var, value=2).pack(side=tk.LEFT)
+        top_modes = ttk.Frame(mode_frame)
+        top_modes.pack(anchor=tk.W)
+        ttk.Radiobutton(top_modes, text="寰球救援", variable=self.mode_var, value=0).pack(side=tk.LEFT)
+        ttk.Radiobutton(top_modes, text="关卡模式", variable=self.mode_var, value=1).pack(side=tk.LEFT)
+        entry_frame = ttk.Frame(mode_frame)
+        entry_frame.pack(anchor=tk.W, padx=(18, 0), pady=(5, 0))
+        ttk.Label(entry_frame, text="入队方式:").pack(side=tk.LEFT)
+        self.huanqiu_entry_var = tk.StringVar(value='channel')
+        self.huanqiu_entry_buttons = []
+        for label, value in [('频道招募', 'channel'), ('副本邀请', 'invite')]:
+            button = ttk.Radiobutton(
+                entry_frame, text=label, variable=self.huanqiu_entry_var, value=value
+            )
+            button.pack(side=tk.LEFT)
+            self.huanqiu_entry_buttons.append(button)
+        self.mode_var.trace_add('write', self.update_mode_options)
+        self.update_mode_options()
 
         # 战斗次数
-        ttk.Label(self.root, text="战斗次数:").grid(row=2, column=0, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(battle_frame, text="战斗次数:").grid(row=2, column=0, padx=10, pady=5, sticky=tk.W)
         self.battle_count_var = tk.IntVar(value=0)
-        ttk.Spinbox(self.root, from_=0, to=999, textvariable=self.battle_count_var, width=10).grid(row=2, column=1,
+        ttk.Spinbox(battle_frame, from_=0, to=999, textvariable=self.battle_count_var, width=10).grid(row=2, column=1,
                                                                                                    padx=10, pady=5,
                                                                                                    sticky=tk.W)
-        ttk.Label(self.root, text="(0表示无限循环)").grid(row=2, column=2, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(battle_frame, text="(0表示无限循环)").grid(row=2, column=2, padx=5, pady=5, sticky=tk.W)
 
         # 战斗时间
-        ttk.Label(self.root, text="战斗时间(秒):").grid(row=3, column=0, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(battle_frame, text="战斗时间(秒):").grid(row=3, column=0, padx=10, pady=5, sticky=tk.W)
         self.battle_time_var = tk.IntVar(value=0)
-        ttk.Spinbox(self.root, from_=0, to=999, textvariable=self.battle_time_var, width=10).grid(row=3, column=1,
+        ttk.Spinbox(battle_frame, from_=0, to=999, textvariable=self.battle_time_var, width=10).grid(row=3, column=1,
                                                                                                   padx=10, pady=5,
                                                                                                   sticky=tk.W)
-        ttk.Label(self.root, text="(0表示无限制)").grid(row=3, column=2, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(battle_frame, text="(0表示无限制)").grid(row=3, column=2, padx=5, pady=5, sticky=tk.W)
 
         # 提示标签
-        ttk.Label(self.root, text="提示: 按ESC键暂停脚本", foreground="blue").grid(row=4, column=0, columnspan=3,
+        ttk.Label(self.root, text="提示: 按ESC键停止脚本", foreground="blue").grid(row=4, column=0,
                                                                                    padx=10, pady=5, sticky=tk.W)
 
         # 优先技能选项（5个）
-        ttk.Label(self.root, text="优先技能(从上到下):").grid(row=5, column=0, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(battle_frame, text="优先技能(从上到下):").grid(row=5, column=0, padx=10, pady=5, sticky=tk.W)
 
         # 获取技能名称列表
         skill_names = [skill["name"] for skill in SKILL_LIST]
@@ -2245,15 +2228,15 @@ class GameBotGUI:
         for i in range(5):
             var = tk.StringVar(value="")
             self.priority_skill_vars.append(var)
-            combo = ttk.Combobox(self.root, textvariable=var, values=[""] + skill_names, width=15, state="readonly")
+            combo = ttk.Combobox(battle_frame, textvariable=var, values=[""] + skill_names, width=15, state="readonly")
             combo.grid(row=5 + i, column=1, padx=10, pady=3, sticky=tk.W)
             combo.bind("<<ComboboxSelected>>", self.on_skill_selected)
             self.priority_skill_combos.append(combo)
-            ttk.Label(self.root, text=f"优先级{i + 1}").grid(row=5 + i, column=2, padx=5, pady=3, sticky=tk.W)
+            ttk.Label(battle_frame, text=f"优先级{i + 1}").grid(row=5 + i, column=2, padx=5, pady=3, sticky=tk.W)
 
         # 按钮框架
         button_frame = ttk.Frame(self.root)
-        button_frame.grid(row=10, column=0, columnspan=3, padx=10, pady=20)
+        button_frame.grid(row=2, column=0, padx=10, pady=10)
 
         # 开始按钮
         self.start_btn = ttk.Button(button_frame, text="开始", command=self.start_bot, width=15)
@@ -2269,40 +2252,33 @@ class GameBotGUI:
 
         # 状态标签
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(self.root, textvariable=self.status_var, foreground="green").grid(row=11, column=0, columnspan=3,
+        ttk.Label(self.root, textvariable=self.status_var, foreground="green").grid(row=3, column=0,
                                                                                     padx=10, pady=10)
 
-        ttk.Label(self.root, text='组队等待时间(秒):').grid(
-            row=12, column=0, padx=10, pady=5, sticky=tk.W
+        ttk.Label(base_frame, text='组队等待时间(秒):').grid(
+            row=2, column=0, padx=10, pady=5, sticky=tk.W
         )
         self.group_wait_timeout_var = tk.IntVar(value=30)
         ttk.Spinbox(
-            self.root,
+            base_frame,
             from_=0,
             to=999,
             textvariable=self.group_wait_timeout_var,
             width=10,
-        ).grid(row=12, column=1, padx=10, pady=5, sticky=tk.W)
-        ttk.Label(self.root, text='(0表示一直等待)').grid(
-            row=12, column=2, padx=5, pady=5, sticky=tk.W
+        ).grid(row=2, column=1, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(base_frame, text='(0表示一直等待)').grid(
+            row=2, column=2, padx=5, pady=5, sticky=tk.W
         )
 
-        self.exit_deep_abyss_var = tk.BooleanVar(value=False)
+        self.exit_on_mode_mismatch_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            self.root,
-            text='深渊同行战斗时自动退出',
-            variable=self.exit_deep_abyss_var,
+            battle_frame,
+            text='模式误入退出（与所选模式不符时自动退出）',
+            variable=self.exit_on_mode_mismatch_var,
         ).grid(row=13, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
-
-        self.exit_normal_stage_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            self.root,
-            text='打寰球时误入普通关卡自动退出',
-            variable=self.exit_normal_stage_var,
-        ).grid(row=14, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
         self.prioritize_biochemical_bullet_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            self.root,
+            battle_frame,
             text='生化子弹出现时无视技能优先级',
             variable=self.prioritize_biochemical_bullet_var,
         ).grid(row=15, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
@@ -2323,42 +2299,27 @@ class GameBotGUI:
             available = [""] + [s for s in all_skills if s not in selected_skills or s == current_value]
             combo['values'] = available
 
+    def update_mode_options(self, *_):
+        """关卡模式不使用寰球入队方式，保留上次选择供切回时使用。"""
+        state = tk.NORMAL if self.mode_var.get() == 0 else tk.DISABLED
+        for button in self.huanqiu_entry_buttons:
+            button.configure(state=state)
+
     def start_bot(self):
         """开始运行游戏机器人"""
         try:
-            # 获取界面参数
-            game_title = self.game_title_var.get()
-            mode = self.mode_var.get()
-            battle_count = self.battle_count_var.get()
-            battle_time = self.battle_time_var.get()
-            group_wait_timeout = max(0, self.group_wait_timeout_var.get())
-            exit_deep_abyss = self.exit_deep_abyss_var.get()
-            exit_normal_stage = self.exit_normal_stage_var.get()
-            prioritize_biochemical_bullet = self.prioritize_biochemical_bullet_var.get()
-
-            # 获取5个优先技能（将中文名称转换为模板文件名）
-            priority_skills = []
-            for var in self.priority_skill_vars:
-                skill_name = var.get()
-                if skill_name:
-                    template = self.get_skill_template_by_name(skill_name)
-                    if template:
-                        priority_skills.append(template)
+            base_config, battle_config = self.collect_settings()
 
             # 保存配置
             self.save_config()
 
             # 验证参数
-            if not game_title:
+            if not base_config.game_title:
                 messagebox.showerror("错误", "请输入游戏窗口标题")
                 return
 
             # 创建GameBot实例
-            self.bot = GameBot(game_title, battle_time, battle_count, mode, priority_skills)
-            self.bot.group_wait_timeout = group_wait_timeout
-            self.bot.exit_deep_abyss = exit_deep_abyss
-            self.bot.exit_normal_stage_on_huanqiu = exit_normal_stage
-            self.bot.prioritize_biochemical_bullet = prioritize_biochemical_bullet
+            self.bot = GameBot(base_config, battle_config)
 
             # 更新状态
             self.status_var.set("运行中...")
