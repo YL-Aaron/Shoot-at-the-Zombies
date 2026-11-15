@@ -89,6 +89,7 @@ class GameBot:
         self.group_wait_started_at = None
         self.exit_normal_stage = False
         self.mode_exit_pending = False
+        self.pause_exit_menu_open = False
         self.expecting_huanqiu_battle = False
         self.initial_skill_check_deadline = None
         self.battle_identify_not_before = None
@@ -1581,6 +1582,10 @@ class GameBot:
         frame = self.take_screenshot()
         if frame is None:
             return False
+        # 下方的像素条件基于 545 宽截图，先归一化以兼容窗口缩放。
+        scale = 545 / frame.shape[1]
+        if abs(scale - 1.0) > 0.01:
+            frame = cv2.resize(frame, None, fx=scale, fy=scale)
         frame_height, frame_width = frame.shape[:2]
         title_frame = frame[
             int(frame_height * 0.059):int(frame_height * 0.123),
@@ -1602,23 +1607,43 @@ class GameBot:
             and 2 <= box[3] <= 7
             and 25 <= box[1] <= 42
         ]
-        for dot_x, dot_y, dot_width, _, _ in dots:
+        for dot_x, dot_y, dot_width, dot_height, _ in dots:
             digits = [
                 box for box in components
                 if 3 <= box[2] <= 14
                 and 14 <= box[3] <= 25
                 and 8 <= box[1] <= 30
-                and dot_x - 38 <= box[0] < dot_x
-                and dot_x - 7 <= box[0] + box[2] <= dot_x + 1
+                and dot_x - 65 <= box[0] < dot_x
+                and box[0] + box[2] <= dot_x + 1
+                and abs(box[1] + box[3] - dot_y - dot_height) <= 5
             ]
+            # 至少两个连续数字，并且最后一位紧邻小数点。
+            # 单独的伤害数值、计时器或特效不作为关卡标题证据。
+            digit_run = []
+            right_edge = dot_x
+            for box in sorted(digits, key=lambda item: item[0], reverse=True):
+                if (
+                    0 <= right_edge - box[0] - box[2] <= 6
+                    and (not digit_run or abs(box[1] - digit_run[-1][1]) <= 3)
+                ):
+                    digit_run.append(box)
+                    right_edge = box[0]
+            if len(digit_run) < 2:
+                continue
             text = [
                 box for box in components
-                if box[2] >= 14
-                and box[3] >= 16
+                if 14 <= box[2] <= 30
+                and 16 <= box[3] <= 30
                 and 8 <= box[1] <= 30
                 and dot_x + dot_width <= box[0] <= dot_x + 100
+                and abs(box[1] + box[3] - digit_run[0][1] - digit_run[0][3]) <= 6
             ]
-            if digits and len(text) >= 2:
+            text.sort(key=lambda item: item[0])
+            if (
+                len(text) >= 2
+                and text[0][0] - dot_x - dot_width <= 8
+                and 0 <= text[1][0] - text[0][0] - text[0][2] <= 8
+            ):
                 return True
         return False
     def classify_battle_type(self):
@@ -1638,14 +1663,61 @@ class GameBot:
         return battle_type == expected
 
     def exit_mismatched_battle(self):
-        """退出未成功时保留状态，下一轮继续退出，避免重新选技能。"""
-        if not self.find_exit(attempts=1):
-            self.find_stop()
-            if not self.find_exit():
+        """先处理返回/暂停页签，已打开的暂停菜单不重复点击暂停。"""
+        frame = self.take_screenshot()
+        if frame is None:
+            return False
+        if self.find_return(screenshot=frame) or self.find_exit(attempts=1):
+            self.reset_battle_exit_state()
+            return True
+
+        if self.open_pause_settings(screenshot=frame):
+            self.pause_exit_menu_open = True
+        elif not self.pause_exit_menu_open:
+            # 必须仍在战斗页，才能点击暂停；结算、转场页面不点比例坐标。
+            if not self.find_battling():
                 return False
+            self.find_stop()
+            self.pause_exit_menu_open = True
+            self.open_pause_settings()
+
+        if not self.find_exit():
+            return False
+        self.reset_battle_exit_state()
+        return True
+
+    def reset_battle_exit_state(self):
         self.mode_exit_pending = False
+        self.pause_exit_menu_open = False
         self.exit_normal_stage = False
         self.expecting_huanqiu_battle = False
+
+    def open_pause_settings(self, screenshot=None):
+        """暂停默认停在奖励总览，切到设置页签后才能寻找退出按钮。"""
+        if not self.game_window:
+            return False
+        frame = screenshot if screenshot is not None else self.take_screenshot()
+        if frame is None:
+            return False
+        _, _, width, height = self.game_window
+        if not self.find_template(
+            'pause-rewards-title.png', threshold=0.78, use_gray=False,
+            screenshot=frame,
+            roi=(int(width * 0.18), int(height * 0.10),
+                 int(width * 0.64), int(height * 0.40)),
+        ):
+            return False
+        settings = self.find_template(
+            'pause-settings-tab.png', threshold=0.78, use_gray=False,
+            screenshot=frame,
+            roi=(int(width * 0.65), int(height * 0.50),
+                 int(width * 0.35), int(height * 0.45)),
+        )
+        if not settings:
+            return False
+        if self.click_fast(*settings):
+            print('暂停菜单位于奖励总览，已切换到设置页查找退出按钮')
+            self.sleep_interruptible(0.3)
         return True
 
     def dismiss_activated_skill_page(self):
@@ -1719,15 +1791,18 @@ class GameBot:
             self.sleep_interruptible(0.03)
         return True
 
-    def find_return(self):
+    def find_return(self, screenshot=None):
         """判断是否在返回主界面"""
-        return_button = self.find_template("return.png")
+        return_button = self.find_template("return.png", screenshot=screenshot)
         if not return_button:
-            return_button = self.find_template("return-2.png")
+            return_button = self.find_template("return-2.png", screenshot=screenshot)
 
         if return_button:
-            self.click(*return_button)
+            if not self.click(*return_button):
+                return False
             self.sleep_interruptible(0.2)
+            return True
+        return False
 
     def find_stop(self):
         """判断能否发现停止按钮"""
@@ -1782,7 +1857,8 @@ class GameBot:
                 return True
             if attempt < attempts - 1:
                 self.sleep_interruptible(0.2)
-        print('暂停菜单中未找到退出按钮，稍后将重试')
+        if attempts > 1:
+            print('暂停菜单中未找到退出按钮，保留菜单并等待重试')
         return False
 
     def find_card(self):
@@ -1866,6 +1942,8 @@ class GameBot:
             batileTime = None
             battle_seen = False
             battle_type_verified = False
+            mismatch_candidate = None
+            mismatch_confirmations = 0
             # 是不是在战斗中
             while True and self.running:
 
@@ -1903,6 +1981,8 @@ class GameBot:
 
                 # Skill pages can also appear after the initial 15 seconds.
                 if self.handle_battle_skill_page():
+                    mismatch_candidate = None
+                    mismatch_confirmations = 0
                     continue
                 if (
                     self.battle_identify_not_before is not None
@@ -1924,9 +2004,20 @@ class GameBot:
                         self.expecting_huanqiu_battle = self.is_huanqiu_mode
                         battle_type_verified = True
                     elif self.handle_battle_skill_page():
+                        mismatch_candidate = None
+                        mismatch_confirmations = 0
                         print('判断模式期间出现技能选择页，处理后重新判断')
                         continue
                     elif matches is False:
+                        if mismatch_candidate == battle_type:
+                            mismatch_confirmations += 1
+                        else:
+                            mismatch_candidate = battle_type
+                            mismatch_confirmations = 1
+                        if mismatch_confirmations < 3:
+                            print(f'疑似模式不符，等待连续确认（{detail}，{mismatch_confirmations}/3）')
+                            self.sleep_interruptible(0.15)
+                            continue
                         selected = '寰球救援' if self.is_huanqiu_mode else '关卡模式'
                         print(f'模式误入退出：选择了{selected}，检测到{detail}，正在退出')
                         self.mode_exit_pending = True
@@ -1934,6 +2025,8 @@ class GameBot:
                             break
                         continue
                     else:
+                        mismatch_candidate = None
+                        mismatch_confirmations = 0
                         print(f'战斗模式尚未明确（{detail}）')
                         self.sleep_interruptible(0.2)
                         continue
